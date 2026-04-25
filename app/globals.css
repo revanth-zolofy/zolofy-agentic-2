@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+/* Chat input placeholder: primary accent at 40% opacity */
+input[data-z-chat-input]::placeholder {
+  color: rgba(0, 122, 255, 0.4);
+}
+
+/* Zolly avatar — pulse glow when typing */
+@keyframes zolly-pulse {
+  0%   { box-shadow: 0 0 0 0   rgba(92, 78, 255, 0.4); }
+  70%  { box-shadow: 0 0 0 8px rgba(92, 78, 255, 0);   }
+  100% { box-shadow: 0 0 0 0   rgba(92, 78, 255, 0);   }
+}
+
+/* Zolly avatar — shimmer sweep when typing */
+@keyframes zolly-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%);  }
+}
+
+.zolly-pulse {
+  animation: zolly-pulse 1.5s ease-out infinite;
+}
+
+.zolly-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+  animation: zolly-shimmer 1.5s linear infinite;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* Category marquee */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+
+.z-marquee {
+  animation: marquee 30s linear infinite;
+}
+
+/* Product card hover lift — 200ms ease-out, no bounce */
+.z-product-card {
+  transition: transform 200ms ease-out, box-shadow 200ms ease-out;
+}
+.z-product-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
