@@ -28,6 +28,7 @@ export const create = mutation({
     variables: v.array(
       v.object({
         name: v.string(),
+        label: v.optional(v.string()),
         role: v.string(),
         min: v.number(),
         max: v.number(),
@@ -57,6 +58,7 @@ export const update = mutation({
     variables: v.array(
       v.object({
         name: v.string(),
+        label: v.optional(v.string()),
         role: v.string(),
         min: v.number(),
         max: v.number(),
@@ -70,5 +72,12 @@ export const update = mutation({
   handler: async (ctx, args) => {
     const { id, ...fields } = args;
     await ctx.db.patch(id, fields);
+  },
+});
+
+export const remove = mutation({
+  args: { id: v.id('merchantProducts') },
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.id);
   },
 });

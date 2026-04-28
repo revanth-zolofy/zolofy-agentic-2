@@ -13,6 +13,7 @@ export default defineSchema({
     formula: v.string(),
     variables: v.array(v.object({
       name: v.string(),
+      label: v.optional(v.string()),
       role: v.string(),
       min: v.number(),
       max: v.number(),

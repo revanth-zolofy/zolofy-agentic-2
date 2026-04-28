@@ -50,3 +50,61 @@ input[data-z-chat-input]::placeholder {
   transform: translateY(-2px);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
 }
+
+/* Mobile product banner — hidden on desktop, shown on mobile */
+.z-product-mobile-banner { display: none; }
+
+/* ── Mobile responsive layout (< 768px) ── */
+@media (max-width: 767px) {
+  /* Hide nav sidebar — reclaim horizontal space */
+  .z-nav-sidebar { display: none !important; }
+
+  /* Hide left context panel — full-width chat on mobile */
+  .z-context-panel { display: none !important; }
+
+  /* Compact header padding */
+  .z-chat-header { padding: 12px 16px !important; }
+
+  /* Use dvh so the keyboard dynamically shrinks the container */
+  .z-chat-outer { height: 100dvh !important; }
+
+  /* Messages: compact horizontal padding + bottom clear for fixed input bar */
+  .z-messages-area { padding: 16px 12px 100px !important; }
+
+  /* Input bar: fixed to visual bottom above keyboard */
+  .z-input-wrapper {
+    position: fixed !important;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 30;
+    padding: 10px 16px !important;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom)) !important;
+    background: #FFFFFF;
+    border-top: 1px solid #E5E5EA;
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.06);
+  }
+
+  /* Show inline product banner in chat stream */
+  .z-product-mobile-banner {
+    display: block;
+    flex-shrink: 0;
+    padding: 8px 12px;
+    background: #F8F8FF;
+    border-bottom: 1px solid #E5E5EA;
+  }
+
+  /* Confirmation row: stack label above input on mobile */
+  .z-confirm-row {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 4px !important;
+    padding: 10px 8px !important;
+  }
+  .z-confirm-input-wrap { justify-content: flex-start !important; }
+  .z-confirm-input-wrap > div { width: 100%; }
+  .z-confirm-input-wrap input {
+    text-align: left !important;
+    font-size: 16px !important;
+  }
+}

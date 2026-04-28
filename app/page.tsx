@@ -25,7 +25,7 @@ type Product = {
   baseRate: number;
   currency: string;
   formula: string;
-  variables: { name: string; role: string; min: number; max: number; hint: string }[];
+  variables: { name: string; label?: string; role: string; min: number; max: number; hint: string }[];
   constants: Record<string, number>;
   imageUrl: string;
   developerNote: string;
@@ -125,7 +125,7 @@ export default function Home() {
   const [mandate, setMandate]         = useState<Mandate | null>(null);
   const [sheetOpen, setSheetOpen]     = useState(false);
   const [flashActive, setFlashActive] = useState(false);
-  const [autoFired, setAutoFired] = useState(false);
+  const [lockingIn, setLockingIn]     = useState(false);
 
   const inputRef  = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -150,6 +150,44 @@ export default function Home() {
       )
     : null;
 
+  // Fix B — reconcile pendingVars when identifiedProduct loads from Convex after
+  // the API call (race condition where products weren't loaded yet when
+  // dispatchMessage ran, or when the model returned label-keyed variables).
+  // Runs only when the identified product or active tool call changes.
+  useEffect(() => {
+    if (!identifiedProduct || !toolCallEntry) return;
+
+    const extractedVars = (toolCallEntry.input.extracted_variables ?? {}) as Record<string, number>;
+
+    setPendingVars((prev) => {
+      // No-op if every variable name already has an entry
+      if (identifiedProduct.variables.every((v) => v.name in prev)) return prev;
+
+      const next: Record<string, string> = {};
+      for (const v of identifiedProduct.variables) {
+        if (v.name in prev) {
+          // Already keyed correctly — preserve the value (may have been edited)
+          next[v.name] = prev[v.name];
+          continue;
+        }
+        // Key missing — apply the same normalisation fallback as dispatchMessage
+        let extracted: number | undefined = extractedVars[v.name];
+        if (extracted === undefined) {
+          const fallbackKey = Object.keys(extractedVars).find(
+            (k) =>
+              k.toLowerCase().replace(/\s+/g, '_') === v.name.toLowerCase() ||
+              k.toLowerCase() === v.label?.toLowerCase()
+          );
+          if (fallbackKey !== undefined) extracted = extractedVars[fallbackKey];
+        }
+        next[v.name] = extracted !== undefined ? String(extracted) : '';
+      }
+      return next;
+    });
+  // Depend on stable IDs so this doesn't re-run on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identifiedProduct?._id, toolCallEntry?.tool_use_id]);
+
   /* ── Send logic ── */
   async function dispatchMessage(userText: string, history: ChatEntry[]) {
     setSending(true);
@@ -158,11 +196,21 @@ export default function Home() {
       .filter((e) => e.kind === 'user' || e.kind === 'assistant')
       .map((e) => ({ role: e.kind as 'user' | 'assistant', content: (e as { text: string }).text }));
 
+    // Read user profile from localStorage so Zolly can be location-aware.
+    let userProfile: Record<string, unknown> | undefined;
+    try {
+      const profileRaw = localStorage.getItem('zolofy_profile');
+      if (profileRaw) {
+        const parsed = JSON.parse(profileRaw);
+        if (parsed && typeof parsed === 'object') userProfile = parsed;
+      }
+    } catch { /* localStorage unavailable — skip */ }
+
     try {
       const res = await fetch('/api/zolly', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: apiMessages, catalog: products ?? [] }),
+        body: JSON.stringify({ messages: apiMessages, catalog: products ?? [], userProfile }),
       });
 
       const ct = res.headers.get('content-type') ?? '';
@@ -172,42 +220,51 @@ export default function Home() {
         if (data.error) {
           setError(data.error);
         } else if (data.type === 'tool_call') {
-          const extractedVars = data.input.extracted_variables as Record<string, number>;
+          const extractedVars = (data.input.extracted_variables ?? {}) as Record<string, number>;
           const matchedProduct = (products ?? []).find(
             (p) => p.productName.toLowerCase() === (data.input.productName as string).toLowerCase()
           );
-          const allVarNames = matchedProduct?.variables.map((v) => v.name) ?? [];
-          const allPresent =
-            allVarNames.length > 0 && allVarNames.every((name) => name in extractedVars);
 
-          // Pre-fill pending vars from extracted values
+          console.log('[zolly] tool_call received', {
+            productName: data.input.productName,
+            extracted_variables: extractedVars,
+            matchedProduct: matchedProduct?.productName ?? null,
+            productVariables: matchedProduct?.variables.map((v) => v.name) ?? [],
+          });
+
+          // Pre-fill ALL product variables. Extracted ones get their value;
+          // others stay as '' so the input shows its hint placeholder.
+          // The model may return label-keyed values (e.g. "Rental Days": 3)
+          // instead of name-keyed (rental_days: 3) — the fallback handles that.
           const initial: Record<string, string> = {};
-          for (const [k, v] of Object.entries(extractedVars)) {
-            initial[k] = String(v);
+          if (matchedProduct) {
+            for (const v of matchedProduct.variables) {
+              let value = extractedVars[v.name];
+              if (value === undefined) {
+                const fallback = Object.keys(extractedVars).find(
+                  (k) =>
+                    k.toLowerCase().replace(/\s+/g, '_') === v.name.toLowerCase() ||
+                    k.toLowerCase() === v.label?.toLowerCase()
+                );
+                if (fallback !== undefined) value = extractedVars[fallback];
+              }
+              initial[v.name] = value !== undefined ? String(value) : '';
+            }
+          } else {
+            // Products not yet in Convex — store raw keys from the model.
+            // The reconciliation useEffect will re-key once identifiedProduct loads.
+            for (const [k, val] of Object.entries(extractedVars)) {
+              initial[k] = String(val);
+            }
           }
+          console.log('[zolly] pre-filled values', initial);
           setPendingVars(initial);
           setMandate(null);
 
-          if (allPresent && matchedProduct) {
-            // All variables known — skip form, fire mandate directly
-            setAutoFired(true);
-            setEntries((prev) => {
-              const withoutOld = prev.filter((e) => e.kind !== 'tool_call');
-              return [
-                ...withoutOld,
-                { kind: 'tool_call', input: data.input, tool_use_id: data.tool_use_id },
-                { kind: 'assistant', text: 'Perfect, locking in your quote…' },
-              ];
-            });
-            await fetchMandate(matchedProduct._id, extractedVars);
-          } else {
-            // Some or no variables — show form for missing ones
-            setAutoFired(false);
-            setEntries((prev) => {
-              const withoutOld = prev.filter((e) => e.kind !== 'tool_call');
-              return [...withoutOld, { kind: 'tool_call', input: data.input, tool_use_id: data.tool_use_id }];
-            });
-          }
+          setEntries((prev) => {
+            const withoutOld = prev.filter((e) => e.kind !== 'tool_call');
+            return [...withoutOld, { kind: 'tool_call', input: data.input, tool_use_id: data.tool_use_id }];
+          });
         }
       } else {
         const text = await res.text();
@@ -239,12 +296,10 @@ export default function Home() {
         dispatchMessage(userText, firstHistory);
       }, 300);
     } else {
-      // Already in chat — append user message then send
-      setEntries((prev) => {
-        const next: ChatEntry[] = [...prev, { kind: 'user', text: userText }];
-        dispatchMessage(userText, next);
-        return next;
-      });
+      // Already in chat — update state first, then trigger the side effect once.
+      const nextHistory: ChatEntry[] = [...entries, { kind: 'user', text: userText }];
+      setEntries(nextHistory);
+      dispatchMessage(userText, nextHistory);
     }
   }
 
@@ -306,21 +361,41 @@ export default function Home() {
     }
   }
 
-  async function handleCalculate() {
+  async function handleLockIn() {
     if (!identifiedProduct) return;
     setError(null);
     const vars: Record<string, number> = {};
     try {
-      for (const [k, v] of Object.entries(pendingVars)) {
-        const n = Number(v);
-        if (!Number.isFinite(n)) throw new Error(`"${k}" must be a number`);
-        vars[k] = n;
+      for (const v of identifiedProduct.variables) {
+        const raw = pendingVars[v.name];
+        if (raw === undefined || raw === '') {
+          throw new Error(`"${v.name}" is required`);
+        }
+        const n = Number(raw);
+        if (!Number.isFinite(n)) throw new Error(`"${v.name}" must be a number`);
+        vars[v.name] = n;
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       return;
     }
-    await fetchMandate(identifiedProduct._id, vars);
+    setLockingIn(true);
+    try {
+      await fetchMandate(identifiedProduct._id, vars);
+    } finally {
+      setLockingIn(false);
+    }
+  }
+
+  function handleCancelConfirmation() {
+    setEntries((prev) => [
+      ...prev.filter((e) => e.kind !== 'tool_call'),
+      { kind: 'assistant', text: 'No problem — what would you like to change?' },
+    ]);
+    setPendingVars({});
+    setMandate(null);
+    setError(null);
+    setTimeout(() => inputRef.current?.focus(), 0);
   }
 
   function dismissSheet() {
@@ -335,7 +410,7 @@ export default function Home() {
       setEntries([]);
       setPendingVars({});
       setError(null);
-      setAutoFired(false);
+      setLockingIn(false);
       setOpacity(0);
       setTimeout(() => {
         setMode('landing');
@@ -349,6 +424,7 @@ export default function Home() {
   /* ── Shared header ── */
   const header = (
     <header
+      className="z-chat-header"
       style={{
         padding: '20px 24px',
         display: 'flex',
@@ -385,7 +461,7 @@ export default function Home() {
       }}
     >
       <input
-        ref={isLanding ? inputRef : undefined}
+        ref={inputRef}
         type="text"
         value={input}
         onChange={(e) => setInput(e.target.value)}
@@ -540,7 +616,7 @@ export default function Home() {
 
       {/* ── CHAT ── */}
       {mode === 'chat' && (
-        <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
+        <div className="z-chat-outer" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
           {header}
 
           {/* Body split */}
@@ -548,6 +624,7 @@ export default function Home() {
 
             {/* Left context panel — 28% */}
             <aside
+              className="z-context-panel"
               style={{
                 width: '28%',
                 flexShrink: 0,
@@ -585,9 +662,17 @@ export default function Home() {
                 overflow: 'hidden',
               }}
             >
+              {/* Mobile-only compact product banner — replaces the hidden left panel */}
+              {identifiedProduct && (
+                <div className="z-product-mobile-banner">
+                  <ProductInlineBanner product={identifiedProduct} />
+                </div>
+              )}
+
               {/* Messages */}
               <div
                 ref={scrollRef}
+                className="z-messages-area"
                 style={{
                   flex: 1,
                   overflowY: 'auto',
@@ -643,20 +728,19 @@ export default function Home() {
                     );
                   }
 
-                  // tool_call — configuration card (hidden when auto-fired)
-                  if (autoFired) return null;
+                  // tool_call — waiter-style confirmation card
                   return (
                     <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
                       <ZollyAvatar />
                       <div style={{ flex: 1, minWidth: 0, maxWidth: '80%' }}>
-                        <ConfigCard
+                        <ConfirmationCard
                           product={identifiedProduct ?? null}
                           productName={entry.input.productName}
-                          extractedVarNames={Object.keys(entry.input.extracted_variables)}
                           values={pendingVars}
                           onChange={setPendingVars}
-                          onCalculate={handleCalculate}
-                          calculating={calculating}
+                          onLockIn={handleLockIn}
+                          onCancel={handleCancelConfirmation}
+                          lockingIn={lockingIn || calculating}
                           mandate={mandate}
                         />
                       </div>
@@ -699,8 +783,9 @@ export default function Home() {
                 )}
               </div>
 
-              {/* Input bar — bottom */}
+              {/* Input bar — bottom (fixed on mobile, in-flow on desktop) */}
               <div
+                className="z-input-wrapper"
                 style={{
                   padding: '16px 28px 20px',
                   borderTop: `1px solid ${SEPARATOR}`,
@@ -770,30 +855,111 @@ function ZollyAvatar({ pulse = false }: { pulse?: boolean }) {
   );
 }
 
-function ConfigCard({
+function ConfirmationRow({
+  variable,
+  value,
+  onChange,
+  disabled,
+  index,
+}: {
+  variable: { name: string; label?: string; hint: string; min: number; max: number };
+  value: string;
+  onChange: (v: string) => void;
+  disabled: boolean;
+  index: number;
+}) {
+  const [focused, setFocused] = useState(false);
+  const isEven = index % 2 === 0;
+
+  return (
+    <div
+      className="z-confirm-row"
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: '12px 8px',
+        background: isEven ? CONTEXT_BG : '#FFFFFF',
+        borderRadius: 8,
+        overflow: 'hidden',
+      }}
+    >
+      <span style={{ fontSize: '13px', color: TEXT_SECONDARY, flexShrink: 0 }}>
+        {variable.label || variable.name}
+      </span>
+      <div
+        className="z-confirm-input-wrap"
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: 'flex',
+          justifyContent: 'flex-end',
+        }}
+      >
+        <div
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            maxWidth: '100%',
+            borderBottom: `1px solid ${focused ? ACCENT : 'transparent'}`,
+            transition: 'border-color 150ms ease',
+          }}
+        >
+          <input
+            type="number"
+            inputMode="decimal"
+            min={variable.min}
+            max={variable.max}
+            step="any"
+            value={value ?? ''}
+            onChange={(e) => onChange(e.target.value)}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            disabled={disabled}
+            placeholder={variable.hint || `${variable.min} – ${variable.max}`}
+            title={variable.hint}
+            style={{
+              width: '100%',
+              maxWidth: '100%',
+              padding: '2px 0',
+              fontSize: '15px',
+              fontWeight: 600,
+              color: TEXT_PRIMARY,
+              background: 'transparent',
+              border: 'none',
+              outline: 'none',
+              textAlign: 'right',
+              fontFamily: 'inherit',
+              textOverflow: 'ellipsis',
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmationCard({
   product,
   productName,
-  extractedVarNames,
   values,
   onChange,
-  onCalculate,
-  calculating,
+  onLockIn,
+  onCancel,
+  lockingIn,
   mandate,
 }: {
   product: Product | null;
   productName: string;
-  extractedVarNames: string[];
   values: Record<string, string>;
   onChange: (v: Record<string, string>) => void;
-  onCalculate: () => void;
-  calculating: boolean;
+  onLockIn: () => void;
+  onCancel: () => void;
+  lockingIn: boolean;
   mandate: Mandate | null;
 }) {
-  const btnDisabled = calculating || !!mandate;
-  // Only show inputs for variables Zolly couldn't extract
-  const varsToShow = product
-    ? product.variables.filter((v) => !extractedVarNames.includes(v.name))
-    : [];
+  const locked = !!mandate;
+  const primaryDisabled = lockingIn || locked;
 
   return (
     <div
@@ -804,17 +970,26 @@ function ConfigCard({
         padding: 24,
       }}
     >
-      {/* Title */}
+      {/* Header */}
       <div
         style={{
           fontSize: '17px',
           fontWeight: 600,
           color: TEXT_PRIMARY,
           letterSpacing: '-0.01em',
-          marginBottom: product ? 20 : 0,
         }}
       >
         {productName}
+      </div>
+      <div
+        style={{
+          fontSize: '13px',
+          color: TEXT_SECONDARY,
+          marginTop: 4,
+          marginBottom: product ? 18 : 0,
+        }}
+      >
+        Here&apos;s what I&apos;m locking in — tap any value to edit:
       </div>
 
       {!product ? (
@@ -823,69 +998,61 @@ function ConfigCard({
         </div>
       ) : (
         <>
-          {/* Variable inputs — only missing vars */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {varsToShow.map((v) => (
-              <div key={v.name}>
-                <label
-                  style={{
-                    display: 'block',
-                    fontSize: '13px',
-                    color: TEXT_SECONDARY,
-                    marginBottom: 6,
-                    fontWeight: 500,
-                  }}
-                >
-                  {v.name}
-                  {v.hint && (
-                    <span style={{ fontWeight: 400, marginLeft: 6 }}>· {v.hint}</span>
-                  )}
-                </label>
-                <input
-                  type="number"
-                  min={v.min}
-                  max={v.max}
-                  step="any"
-                  value={values[v.name] ?? ''}
-                  onChange={(e) => onChange({ ...values, [v.name]: e.target.value })}
-                  disabled={btnDisabled}
-                  placeholder={`${v.min} – ${v.max}`}
-                  style={{
-                    width: '100%',
-                    height: 44,
-                    padding: '0 14px',
-                    fontSize: '15px',
-                    background: '#F4F4F5',
-                    border: 'none',
-                    borderRadius: 10,
-                    color: TEXT_PRIMARY,
-                    outline: 'none',
-                  }}
-                />
-              </div>
+          {/* Inline-editable rows */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {product.variables.map((v, i) => (
+              <ConfirmationRow
+                key={v.name}
+                variable={v}
+                value={values[v.name] ?? ''}
+                onChange={(next) => onChange({ ...values, [v.name]: next })}
+                disabled={primaryDisabled}
+                index={i}
+              />
             ))}
           </div>
 
-          {/* Calculate button */}
+          {/* Primary: Lock it in */}
           <button
-            onClick={onCalculate}
-            disabled={btnDisabled}
+            onClick={onLockIn}
+            disabled={primaryDisabled}
+            className={lockingIn ? 'zolly-pulse' : ''}
             style={{
-              marginTop: 24,
+              marginTop: 20,
               width: '100%',
               height: 52,
               fontSize: '16px',
               fontWeight: 600,
-              borderRadius: 14,
-              background: btnDisabled ? SEPARATOR : ACCENT,
-              color: btnDisabled ? TEXT_SECONDARY : '#FFFFFF',
+              borderRadius: 12,
+              background: primaryDisabled && !lockingIn ? SEPARATOR : ACCENT,
+              color: primaryDisabled && !lockingIn ? TEXT_SECONDARY : '#FFFFFF',
               border: 'none',
-              cursor: btnDisabled ? 'default' : 'pointer',
+              cursor: primaryDisabled ? 'default' : 'pointer',
               letterSpacing: '-0.01em',
               transition: 'background 150ms ease-out, color 150ms ease-out',
             }}
           >
-            {calculating ? 'Calculating…' : mandate ? 'Price locked ✓' : 'Calculate & Lock Price'}
+            {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
+          </button>
+
+          {/* Secondary: Cancel */}
+          <button
+            onClick={onCancel}
+            disabled={lockingIn}
+            style={{
+              marginTop: 10,
+              width: '100%',
+              height: 32,
+              fontSize: '13px',
+              fontWeight: 500,
+              color: TEXT_SECONDARY,
+              background: 'transparent',
+              border: 'none',
+              cursor: lockingIn ? 'default' : 'pointer',
+              textAlign: 'center',
+            }}
+          >
+            Cancel
           </button>
         </>
       )}
@@ -1036,6 +1203,89 @@ function ProductContextCard({ product }: { product: Product }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Mobile inline product banner (replaces left panel on mobile)    */
+/* ------------------------------------------------------------------ */
+
+function ProductInlineBanner({ product }: { product: Product }) {
+  const CategoryIcon = CATEGORY_ICONS[product.productCategory] ?? null;
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+      }}
+    >
+      {/* Category icon chip */}
+      <div
+        style={{
+          width: 36,
+          height: 36,
+          borderRadius: 8,
+          background: PILL_BG,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
+        }}
+      >
+        {CategoryIcon ? (
+          <CategoryIcon size={18} color={ACCENT} strokeWidth={2} />
+        ) : (
+          <span style={{ fontSize: '15px', fontWeight: 700, color: ACCENT }}>
+            {product.productCategory[0]}
+          </span>
+        )}
+      </div>
+
+      {/* Name + store */}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: '13px',
+            fontWeight: 600,
+            color: TEXT_PRIMARY,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {product.productName}
+        </div>
+        <div
+          style={{
+            fontSize: '11px',
+            color: TEXT_SECONDARY,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {product.storeName}
+          {product.storeLocation ? ` · ${product.storeLocation}` : ''}
+        </div>
+      </div>
+
+      {/* Price */}
+      <div style={{ textAlign: 'right', flexShrink: 0 }}>
+        <div
+          style={{
+            fontSize: '15px',
+            fontWeight: 700,
+            color: ACCENT,
+            letterSpacing: '-0.01em',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {product.currency} {product.baseRate.toLocaleString()}
+        </div>
+        <div style={{ fontSize: '10px', color: TEXT_SECONDARY }}>{product.unit}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Left navigation sidebar                                          */
 /* ------------------------------------------------------------------ */
 
@@ -1134,6 +1384,7 @@ function NavSidebar() {
   return (
     <nav
       aria-label="Main navigation"
+      className="z-nav-sidebar"
       style={{
         width: 56,
         flexShrink: 0,
@@ -1501,24 +1752,46 @@ function MandateSheet({
                 {mandate.mandate_id}
               </div>
 
-              {/* Pay button */}
-              <button
-                onClick={handlePay}
-                style={{
-                  width: '100%',
-                  height: 56,
-                  fontSize: '16px',
-                  fontWeight: 600,
-                  borderRadius: 14,
-                  background: 'linear-gradient(135deg, #5C4EFF, #00D4FF)',
-                  color: '#FFFFFF',
-                  border: 'none',
-                  cursor: 'pointer',
-                  letterSpacing: '-0.01em',
-                }}
-              >
-                Pay with Apple Pay
-              </button>
+              {/* Pay buttons — Apple Pay and Google Pay side by side */}
+              <div style={{ display: 'flex', gap: 12 }}>
+                {/* Apple Pay button */}
+                <button
+                  onClick={handlePay}
+                  style={{
+                    flex: 1,
+                    height: 56,
+                    fontSize: '16px',
+                    fontWeight: 600,
+                    borderRadius: 14,
+                    background: 'linear-gradient(135deg, #5C4EFF, #00D4FF)',
+                    color: '#FFFFFF',
+                    border: 'none',
+                    cursor: 'pointer',
+                    letterSpacing: '-0.01em',
+                  }}
+                >
+                  Pay with Apple Pay
+                </button>
+
+                {/* Google Pay button */}
+                <button
+                  onClick={handlePay}
+                  style={{
+                    flex: 1,
+                    height: 56,
+                    fontSize: '16px',
+                    fontWeight: 600,
+                    borderRadius: 14,
+                    background: 'linear-gradient(135deg, #1F2937, #374151)',
+                    color: '#FFFFFF',
+                    border: 'none',
+                    cursor: 'pointer',
+                    letterSpacing: '-0.01em',
+                  }}
+                >
+                  Pay with Google Pay
+                </button>
+              </div>
             </>
           )}
         </div>

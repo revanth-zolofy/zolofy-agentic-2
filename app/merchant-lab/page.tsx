@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, FormEvent, useRef, ChangeEvent } from 'react';
+import { useState, FormEvent, useRef, ChangeEvent, useEffect } from 'react';
 import { useQuery, useMutation } from 'convex/react';
 import { api } from '@/convex/_generated/api';
 import type { Id } from '@/convex/_generated/dataModel';
@@ -12,6 +12,7 @@ import Link from 'next/link';
 
 type VariableRow = {
   name: string;
+  label: string;
   role: string;
   min: string;
   max: string;
@@ -33,7 +34,7 @@ type Product = {
   baseRate: number;
   currency: string;
   formula: string;
-  variables: { name: string; role: string; min: number; max: number; hint: string }[];
+  variables: { name: string; label: string; role: string; min: number; max: number; hint: string }[];
   constants: Record<string, number>;
   imageUrl: string;
   developerNote: string;
@@ -191,6 +192,17 @@ export default function MerchantLab() {
   const products = useQuery(api.merchantProducts.getAll) as Product[] | undefined;
   const createProduct = useMutation(api.merchantProducts.create);
   const updateProduct = useMutation(api.merchantProducts.update);
+  const deleteProduct = useMutation(api.merchantProducts.remove);
+
+  /* ── auth gate ── */
+  // null = not yet checked (waiting for client mount), false = not authed, true = authed
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [pwInput, setPwInput] = useState('');
+  const [pwError, setPwError] = useState(false);
+
+  useEffect(() => {
+    setAuthed(localStorage.getItem('zolofy_admin') === 'true');
+  }, []);
 
   const [editingId, setEditingId] = useState<Id<'merchantProducts'> | null>(null);
   const formTopRef = useRef<HTMLDivElement>(null);
@@ -209,7 +221,7 @@ export default function MerchantLab() {
   const [developerNote, setDeveloperNote] = useState('');
 
   const [variables, setVariables] = useState<VariableRow[]>([
-    { name: '', role: ROLES[0], min: '', max: '', hint: '' },
+    { name: '', label: '', role: ROLES[0], min: '', max: '', hint: '' },
   ]);
   const [constants, setConstants] = useState<ConstantRow[]>([]);
 
@@ -228,7 +240,7 @@ export default function MerchantLab() {
 
   /* ── variable row handlers ── */
   function addVariable() {
-    setVariables((prev) => [...prev, { name: '', role: ROLES[0], min: '', max: '', hint: '' }]);
+    setVariables((prev) => [...prev, { name: '', label: '', role: ROLES[0], min: '', max: '', hint: '' }]);
   }
   function removeVariable(i: number) {
     setVariables((prev) => prev.filter((_, idx) => idx !== i));
@@ -269,12 +281,13 @@ export default function MerchantLab() {
       product.variables.length > 0
         ? product.variables.map((v) => ({
             name: v.name,
+            label: v.label ?? '',
             role: v.role,
             min: String(v.min),
             max: String(v.max),
             hint: v.hint,
           }))
-        : [{ name: '', role: ROLES[0], min: '', max: '', hint: '' }]
+        : [{ name: '', label: '', role: ROLES[0], min: '', max: '', hint: '' }]
     );
     setConstants(
       Object.entries(product.constants ?? {}).map(([key, value]) => ({
@@ -299,10 +312,33 @@ export default function MerchantLab() {
     setFormula('');
     setImageUrl('');
     setDeveloperNote('');
-    setVariables([{ name: '', role: ROLES[0], min: '', max: '', hint: '' }]);
+    setVariables([{ name: '', label: '', role: ROLES[0], min: '', max: '', hint: '' }]);
     setConstants([]);
     setError(null);
     setSuccess(false);
+  }
+
+  /* ── password gate ── */
+  function handlePwSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (pwInput === process.env.NEXT_PUBLIC_ADMIN_PASSWORD) {
+      localStorage.setItem('zolofy_admin', 'true');
+      setAuthed(true);
+    } else {
+      setPwError(true);
+      setPwInput('');
+    }
+  }
+
+  /* ── delete ── */
+  async function handleDelete(product: Product) {
+    if (!window.confirm(`Are you sure you want to delete "${product.productName}"?`)) return;
+    try {
+      await deleteProduct({ id: product._id });
+      if (editingId === product._id) cancelEdit();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   /* ── submit ── */
@@ -312,7 +348,7 @@ export default function MerchantLab() {
     setSuccess(false);
 
     const rate = Number(baseRate);
-    if (!storeName.trim()) return setError('Store name is required.');
+    if (!storeName.trim()) return setError('Business name is required.');
     if (!productName.trim()) return setError('Product name is required.');
     if (!unit.trim()) return setError('Unit is required.');
     if (!Number.isFinite(rate) || rate <= 0) return setError('Base rate must be a positive number.');
@@ -344,6 +380,7 @@ export default function MerchantLab() {
       formula: formula.trim(),
       variables: variables.map((v) => ({
         name: v.name.trim(),
+        label: v.label.trim(),
         role: v.role,
         min: Number(v.min),
         max: Number(v.max),
@@ -374,7 +411,7 @@ export default function MerchantLab() {
       setFormula('');
       setImageUrl('');
       setDeveloperNote('');
-      setVariables([{ name: '', role: ROLES[0], min: '', max: '', hint: '' }]);
+      setVariables([{ name: '', label: '', role: ROLES[0], min: '', max: '', hint: '' }]);
       setConstants([]);
       setSuccess(true);
     } catch (err) {
@@ -383,6 +420,98 @@ export default function MerchantLab() {
       setSubmitting(false);
     }
   }
+
+  /* ── render gate if not authenticated ── */
+  if (authed === null) return null; // waiting for localStorage (avoids SSR flash)
+
+  if (!authed) return (
+    <div
+      style={{
+        minHeight: '100vh',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: COLORS.bg,
+        padding: '0 20px',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 360,
+          background: COLORS.card,
+          borderRadius: 20,
+          padding: '36px 32px',
+          boxShadow: '0 4px 32px rgba(0,0,0,0.08)',
+        }}
+      >
+        {/* Wordmark */}
+        <div style={{ marginBottom: 28, textAlign: 'center' }}>
+          <div style={{ fontSize: '20px', fontWeight: 600, color: COLORS.accent, letterSpacing: '-0.01em' }}>
+            Zolofy
+          </div>
+          <div
+            style={{
+              fontSize: '13px',
+              marginTop: 3,
+              fontWeight: 500,
+              background: WORDMARK_GRADIENT,
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+              backgroundClip: 'text',
+              color: 'transparent',
+              display: 'inline-block',
+            }}
+          >
+            Merchant Lab
+          </div>
+        </div>
+
+        <p style={{ margin: '0 0 20px', fontSize: '14px', color: COLORS.secondary, textAlign: 'center', lineHeight: 1.5 }}>
+          Enter the admin password to manage your catalog.
+        </p>
+
+        <form onSubmit={handlePwSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <input
+            type="password"
+            value={pwInput}
+            onChange={(e) => { setPwInput(e.target.value); setPwError(false); }}
+            placeholder="Password"
+            autoFocus
+            style={{
+              ...fieldStyle,
+              boxShadow: pwError ? `0 0 0 2px ${COLORS.error}` : 'none',
+            }}
+          />
+          {pwError && (
+            <div style={{ fontSize: '13px', color: COLORS.error, paddingLeft: 2 }}>
+              Incorrect password — try again.
+            </div>
+          )}
+          <button
+            type="submit"
+            disabled={!pwInput.trim()}
+            style={{
+              marginTop: 4,
+              height: 48,
+              fontSize: '15px',
+              fontWeight: 600,
+              borderRadius: 12,
+              background: pwInput.trim() ? COLORS.accent : COLORS.separator,
+              color: pwInput.trim() ? '#FFFFFF' : COLORS.secondary,
+              border: 'none',
+              cursor: pwInput.trim() ? 'pointer' : 'default',
+              letterSpacing: '-0.01em',
+              transition: 'background 150ms ease-out, color 150ms ease-out',
+            }}
+          >
+            Enter
+          </button>
+        </form>
+      </div>
+    </div>
+  );
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: COLORS.bg }}>
@@ -470,11 +599,11 @@ export default function MerchantLab() {
 
             <form onSubmit={handleSubmit}>
 
-              {/* ── Store ── */}
+              {/* ── Business ── */}
               <div style={{ background: COLORS.card, borderRadius: 16, padding: 20, marginBottom: 12 }}>
-                <SectionHeader first>Store</SectionHeader>
+                <SectionHeader first>Business</SectionHeader>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <Field label="Store name">
+                  <Field label="Business name">
                     <input
                       style={fieldStyle}
                       value={storeName}
@@ -638,18 +767,23 @@ export default function MerchantLab() {
                         padding: 12,
                       }}
                     >
-                      {/* Row 1: name + role + remove */}
+                      {/* Row 1: name (ID) + label (display name) */}
                       <div
                         style={{
                           display: 'grid',
-                          gridTemplateColumns: '1fr 1fr auto',
+                          gridTemplateColumns: '1fr 1fr',
                           gap: 8,
                           marginBottom: 8,
                           alignItems: 'end',
                         }}
                       >
                         <div>
-                          <label style={labelStyle}>Name</label>
+                          <label style={labelStyle}>
+                            Name{' '}
+                            <span style={{ fontSize: '11px', color: COLORS.secondary, fontWeight: 400 }}>
+                              ID (used in formula)
+                            </span>
+                          </label>
                           <input
                             style={{ ...fieldStyle, height: 38, background: COLORS.card }}
                             value={v.name}
@@ -657,6 +791,27 @@ export default function MerchantLab() {
                             placeholder="e.g. days"
                           />
                         </div>
+                        <div>
+                          <label style={labelStyle}>Label (shown to user)</label>
+                          <input
+                            style={{ ...fieldStyle, height: 38, background: COLORS.card }}
+                            value={v.label}
+                            onChange={(e) => updateVariable(i, 'label', e.target.value)}
+                            placeholder="e.g. Number of days"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Row 2: role + remove */}
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: '1fr auto',
+                          gap: 8,
+                          marginBottom: 8,
+                          alignItems: 'end',
+                        }}
+                      >
                         <div>
                           <label style={labelStyle}>Role</label>
                           <select
@@ -859,6 +1014,7 @@ export default function MerchantLab() {
                       product={p}
                       isEditing={editingId === p._id}
                       onEdit={loadProductForEdit}
+                      onDelete={handleDelete}
                     />
                   ))}
                 </div>
@@ -917,10 +1073,12 @@ function LabProductCard({
   product,
   isEditing,
   onEdit,
+  onDelete,
 }: {
   product: Product;
   isEditing: boolean;
   onEdit: (product: Product) => void;
+  onDelete: (product: Product) => void;
 }) {
   const palette = categoryPalette(product.productCategory);
   return (
@@ -951,26 +1109,47 @@ function LabProductCard({
         >
           {product.productCategory}
         </div>
-        <button
-          type="button"
-          onClick={() => onEdit(product)}
-          disabled={isEditing}
-          style={{
-            height: 26,
-            padding: '0 10px',
-            fontSize: '12px',
-            fontWeight: 500,
-            borderRadius: 7,
-            background: isEditing ? COLORS.bg : COLORS.accent,
-            color: isEditing ? COLORS.secondary : '#FFFFFF',
-            border: 'none',
-            cursor: isEditing ? 'default' : 'pointer',
-            flexShrink: 0,
-            transition: 'background 150ms ease',
-          }}
-        >
-          {isEditing ? 'Editing…' : 'Edit'}
-        </button>
+
+        {/* Edit + Delete button group */}
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button
+            type="button"
+            onClick={() => onEdit(product)}
+            disabled={isEditing}
+            style={{
+              height: 26,
+              padding: '0 10px',
+              fontSize: '12px',
+              fontWeight: 500,
+              borderRadius: 7,
+              background: isEditing ? COLORS.bg : COLORS.accent,
+              color: isEditing ? COLORS.secondary : '#FFFFFF',
+              border: 'none',
+              cursor: isEditing ? 'default' : 'pointer',
+              transition: 'background 150ms ease',
+            }}
+          >
+            {isEditing ? 'Editing…' : 'Edit'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onDelete(product)}
+            style={{
+              height: 26,
+              padding: '0 10px',
+              fontSize: '12px',
+              fontWeight: 500,
+              borderRadius: 7,
+              background: 'transparent',
+              color: COLORS.error,
+              border: `1px solid ${COLORS.error}33`,
+              cursor: 'pointer',
+              transition: 'background 150ms ease, border-color 150ms ease',
+            }}
+          >
+            Delete
+          </button>
+        </div>
       </div>
       <div
         style={{

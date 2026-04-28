@@ -246,7 +246,7 @@ export default function DevPage() {
                 UCP v2026-04-08 compliant
               </span>
               <a
-                href="https://github.com/zolofy/zolofy-agentic"
+                href="https://github.com/revanth-zolofy/zolofy-agentic-2"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 7, background: TEXT_PRIMARY, color: '#FFFFFF', fontSize: 13, fontWeight: 600, padding: '7px 16px', borderRadius: 10, textDecoration: 'none', transition: 'opacity 150ms ease', letterSpacing: '-0.01em' }}
