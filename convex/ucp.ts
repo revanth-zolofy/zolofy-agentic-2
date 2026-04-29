@@ -81,6 +81,30 @@ type CartMandate = {
   validity_window: { ttl_seconds: number; expires_at: string };
 };
 
+export const evaluateOnly = action({
+  args: {
+    productId: v.id('merchantProducts'),
+    variables: v.any(),
+  },
+  handler: async (
+    ctx,
+    args: { productId: Id<'merchantProducts'>; variables: Record<string, number> }
+  ): Promise<{ price: number }> => {
+    const product = await ctx.runQuery(api.merchantProducts.getById, { id: args.productId });
+    if (!product) {
+      throw new Error(`evaluateOnly: product ${args.productId} not found`);
+    }
+    const constants = (product.constants ?? {}) as Record<string, number>;
+    const scope: Record<string, number> = {
+      ...constants,
+      ...args.variables,
+      baseRate: product.baseRate,
+    };
+    const price = evaluateFormula(product.formula, scope);
+    return { price };
+  },
+});
+
 export const generateCartMandate = action({
   args: {
     productId: v.id('merchantProducts'),

@@ -7,6 +7,7 @@ export default defineSchema({
     storeLocation: v.string(),
     productName: v.string(),
     productCategory: v.string(),
+    subCategory: v.optional(v.string()),
     unit: v.string(),
     baseRate: v.number(),
     currency: v.string(),

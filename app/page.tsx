@@ -1,14 +1,17 @@
 'use client';
 
-import { useState, FormEvent, useRef, useEffect } from 'react';
+import { useState, FormEvent, useRef, useEffect, useMemo } from 'react';
+import { Parser } from 'expr-eval';
 import { useQuery } from 'convex/react';
 import { api } from '@/convex/_generated/api';
 import type { Id } from '@/convex/_generated/dataModel';
 import Link from 'next/link';
+import Image from 'next/image';
 import { usePathname } from 'next/navigation';
 import {
   Car, Plane, Calendar, Utensils, Printer,
   Home as HomeIcon, Camera, Dumbbell, FileText, Hammer,
+  ShoppingCart, Trash2,
 } from 'lucide-react';
 
 /* ------------------------------------------------------------------ */
@@ -21,6 +24,7 @@ type Product = {
   storeLocation: string;
   productName: string;
   productCategory: string;
+  subCategory?: string;
   unit: string;
   baseRate: number;
   currency: string;
@@ -36,15 +40,54 @@ type ToolCallInput = {
   extracted_variables: Record<string, number>;
 };
 
+type BundleToolCallInput = {
+  bundleName: string;
+  bundleLabel: string;
+  items: { productName: string; extracted_variables: Record<string, number> }[];
+};
+
 type ChatEntry =
   | { kind: 'user'; text: string }
-  | { kind: 'assistant'; text: string }
-  | { kind: 'tool_call'; input: ToolCallInput; tool_use_id: string };
+  | { kind: 'assistant'; text: string; showCheckout?: boolean }
+  | { kind: 'tool_call'; input: ToolCallInput; tool_use_id: string }
+  | { kind: 'bundle_tool_call'; input: BundleToolCallInput; tool_use_id: string };
+
+function stripCheckoutFlags(entries: ChatEntry[]): ChatEntry[] {
+  return entries.map((e) =>
+    e.kind === 'assistant' && e.showCheckout ? { kind: 'assistant', text: e.text } : e
+  );
+}
+
+function cartLineDisplayTotal(line: CartLine): number {
+  if (line.mandateTotalMinor != null) return line.mandateTotalMinor / 100;
+  return line.lineTotal;
+}
+
+function formatCartMandateExpiry(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  } catch {
+    return iso;
+  }
+}
+
+function cartSummaryFrom(lines: CartLine[]): { itemCount: number; subtotal: number; currency: string } | null {
+  if (lines.length === 0) return null;
+  const currency = lines[0].currency;
+  const subtotal = lines.reduce((s, l) => s + cartLineDisplayTotal(l), 0);
+  return { itemCount: lines.length, subtotal, currency };
+}
 
 type Mandate = {
   ap2_version: string;
   mandate_type: string;
   mandate_id: string;
+  bundle?: boolean;
+  bundle_name?: string;
+  bundle_label?: string;
+  merchants?: { name: string; location: string }[];
   merchant: { name: string; location: string };
   line_items: {
     name: string;
@@ -52,11 +95,85 @@ type Mandate = {
     quantity: number;
     unit_price_minor: number;
     total_minor: number;
+    productId?: string;
+    storeName?: string;
   }[];
   total: { currency: string; amount_minor: number; signed_amount: number };
   validity_window: { ttl_seconds: number; expires_at: string };
   merchant_authorization: string;
 };
+
+type CartLine = {
+  id: string;
+  productId: Id<'merchantProducts'>;
+  productName: string;
+  storeName: string;
+  storeLocation: string;
+  currency: string;
+  unit: string;
+  variables: Record<string, number>;
+  lineTotal: number;
+  /** Set from /api/mandate line_items[].total_minor when the item is added (authoritative total, not base rate). */
+  mandateTotalMinor?: number;
+  mandateId: string;
+  expiresAt: string;
+};
+
+function buildVarsFromPending(
+  product: Product,
+  pending: Record<string, string>
+): Record<string, number> {
+  const vars: Record<string, number> = {};
+  for (const v of product.variables) {
+    const raw = pending[v.name];
+    if (raw === undefined || raw === '') {
+      throw new Error(`"${v.label || v.name}" is required`);
+    }
+    const n = Number(raw);
+    if (!Number.isFinite(n)) throw new Error(`"${v.label || v.name}" must be a number`);
+    vars[v.name] = n;
+  }
+  return vars;
+}
+
+function evaluateProductPrice(product: Product, vars: Record<string, number>): number {
+  const parser = new Parser();
+  const expr = parser.parse(product.formula);
+  const scope: Record<string, number> = {
+    ...(product.constants ?? {}),
+    ...vars,
+    baseRate: product.baseRate,
+  };
+  const required = expr.variables();
+  const missing = required.filter((name) => !(name in scope));
+  if (missing.length > 0) {
+    throw new Error(`Missing variables for price: ${missing.join(', ')}`);
+  }
+  const result = expr.evaluate(scope);
+  if (typeof result !== 'number' || !Number.isFinite(result)) {
+    throw new Error('Price could not be calculated');
+  }
+  return result;
+}
+
+function readStoredUserIdentity(): { name: string; email: string; provider: string } | undefined {
+  try {
+    const identityRaw = localStorage.getItem('zolofy_identity');
+    const profileRaw = localStorage.getItem('zolofy_profile');
+    const identity = identityRaw ? JSON.parse(identityRaw) : null;
+    const profile = profileRaw ? JSON.parse(profileRaw) : null;
+    if (identity?.email || profile?.name) {
+      return {
+        name: profile?.name ?? '',
+        email: identity?.email ?? '',
+        provider: identity?.provider ?? 'self-declared',
+      };
+    }
+  } catch {
+    /* skip */
+  }
+  return undefined;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Tokens                                                            */
@@ -81,31 +198,84 @@ const SEND_ICON = (
   </svg>
 );
 
-const CATEGORY_PILLS: { icon: string; label: string; prompt: string }[] = [
-  { icon: '/symbols/icons8-car-100.png',          label: 'Car Rental',   prompt: 'I need a luxury car rental for a few days'          },
-  { icon: '/symbols/icons8-plane-100.png',         label: 'Travel',       prompt: 'I want to plan a trip to Maldives'                  },
-  { icon: '/symbols/icons8-3-star-hotel-100.png',  label: 'Hotels',       prompt: 'I need to book a hotel stay'                        },
-  { icon: '/symbols/icons8-beach-100.png',         label: 'Beach Resort', prompt: 'I want a beach resort experience'                   },
-  { icon: '/symbols/icons8-cruise-ship-100.png',   label: 'Cruise',       prompt: 'I want to book a cruise package'                    },
-  { icon: '/symbols/icons8-calendar-100.png',      label: 'Events',       prompt: 'I need to plan a corporate event for 50 people'     },
-  { icon: '/symbols/icons8-briefcase-100.png',     label: 'Business',     prompt: 'I need business travel arranged'                    },
-  { icon: '/symbols/icons8-maintenance-100.png',   label: 'Renovation',   prompt: 'I need a home renovation quote'                     },
+const CATEGORY_PILLS: { icon: string; label: string }[] = [
+  { icon: '/symbols/icons8-car-100.png',        label: 'Luxury Rentals' },
+  { icon: '/symbols/icons8-plane-100.png',       label: 'Trip Planning' },
+  { icon: '/symbols/icons8-calendar-100.png',    label: 'Event Management' },
+  { icon: '/symbols/icons8-maintenance-100.png', label: 'Home Renovation' },
 ];
 
 type LucideIcon = React.ComponentType<{ size?: number; color?: string; strokeWidth?: number }>;
 
 const CATEGORY_ICONS: Record<string, LucideIcon> = {
+  'Luxury Rentals':     Car,
+  'Trip Planning':      Plane,
+  'Event Management':   Calendar,
+  'Home Renovation':    Hammer,
+  'Renovation':         Hammer,
+  'Catering':           Utensils,
+  'Printing & Branding': Printer,
+  // legacy keys kept for any existing catalog entries
   Automotive:  Car,
   Travel:      Plane,
   Events:      Calendar,
-  Catering:    Utensils,
-  Printing:    Printer,
   Interiors:   HomeIcon,
   Photography: Camera,
   Fitness:     Dumbbell,
   Legal:       FileText,
-  Renovation:  Hammer,
 };
+
+/* ------------------------------------------------------------------ */
+/*  Keyframe animations                                               */
+/* ------------------------------------------------------------------ */
+
+const KeyframeStyles = () => (
+  <style>{`
+    @keyframes confirmCardIn {
+      from {
+        opacity: 0;
+        transform: scale(0.96);
+      }
+      to {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+    @keyframes detailsExpand {
+      from {
+        opacity: 0;
+        transform: translateY(-8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    @keyframes blink {
+      0%, 50% { opacity: 1; }
+      51%, 100% { opacity: 0; }
+    }
+    @keyframes checkPulse {
+      0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(92, 78, 255, 0.4); }
+      50% { transform: scale(1.02); box-shadow: 0 0 0 8px rgba(92, 78, 255, 0); }
+      100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(92, 78, 255, 0); }
+    }
+    /* Mobile responsive adjustments */
+    @media (max-width: 640px) {
+      .z-landing-container {
+        padding: 16px !important;
+      }
+      .z-landing-headline {
+        font-size: 22px !important;
+        margin-bottom: 24px !important;
+      }
+      .z-landing-search {
+        max-width: 100% !important;
+        padding: 0 4px !important;
+      }
+    }
+  `}</style>
+);
 
 /* ------------------------------------------------------------------ */
 /*  Page                                                              */
@@ -121,17 +291,24 @@ export default function Home() {
   const [sending, setSending]       = useState(false);
   const [error, setError]           = useState<string | null>(null);
   const [pendingVars, setPendingVars] = useState<Record<string, string>>({});
+  const [pendingBundleVars, setPendingBundleVars] = useState<Record<string, Record<string, string>>>({});
   const [calculating, setCalculating] = useState(false);
   const [mandate, setMandate]         = useState<Mandate | null>(null);
   const [sheetOpen, setSheetOpen]     = useState(false);
-  const [flashActive, setFlashActive] = useState(false);
   const [lockingIn, setLockingIn]     = useState(false);
+  const [cart, setCart]               = useState<CartLine[]>([]);
+  const [cartPanelOpen, setCartPanelOpen] = useState(false);
 
   const inputRef  = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const cartRef = useRef<CartLine[]>([]);
 
   // Auto-focus on mount
   useEffect(() => { inputRef.current?.focus(); }, []);
+
+  useEffect(() => {
+    cartRef.current = cart;
+  }, [cart]);
 
   // Scroll chat to bottom on new entries
   useEffect(() => {
@@ -149,6 +326,19 @@ export default function Home() {
         (p) => p.productName.toLowerCase() === toolCallEntry.input.productName.toLowerCase()
       )
     : null;
+
+  // Bundle equivalent — most recent bundle_tool_call entry
+  const bundleEntry = [...entries].reverse().find((e) => e.kind === 'bundle_tool_call') as
+    | (ChatEntry & { kind: 'bundle_tool_call' })
+    | undefined;
+  const bundleProducts: { item: BundleToolCallInput['items'][number]; product: Product | null }[] =
+    bundleEntry && products
+      ? bundleEntry.input.items.map((it) => ({
+          item: it,
+          product:
+            products.find((p) => p.productName.toLowerCase() === it.productName.toLowerCase()) ?? null,
+        }))
+      : [];
 
   // Fix B — reconcile pendingVars when identifiedProduct loads from Convex after
   // the API call (race condition where products weren't loaded yet when
@@ -188,6 +378,45 @@ export default function Home() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identifiedProduct?._id, toolCallEntry?.tool_use_id]);
 
+  // Reconcile bundle vars once products load
+  useEffect(() => {
+    if (!bundleEntry || !products) return;
+    setPendingBundleVars((prev) => {
+      let changed = false;
+      const next: Record<string, Record<string, string>> = { ...prev };
+      for (const item of bundleEntry.input.items) {
+        const matched = products.find(
+          (p) => p.productName.toLowerCase() === item.productName.toLowerCase()
+        );
+        if (!matched) continue;
+        const existing = prev[item.productName] ?? {};
+        if (matched.variables.every((v) => v.name in existing)) continue;
+        const extracted = (item.extracted_variables ?? {}) as Record<string, number>;
+        const perProduct: Record<string, string> = {};
+        for (const v of matched.variables) {
+          if (v.name in existing) {
+            perProduct[v.name] = existing[v.name];
+            continue;
+          }
+          let value: number | undefined = extracted[v.name];
+          if (value === undefined) {
+            const fallbackKey = Object.keys(extracted).find(
+              (k) =>
+                k.toLowerCase().replace(/\s+/g, '_') === v.name.toLowerCase() ||
+                k.toLowerCase() === v.label?.toLowerCase()
+            );
+            if (fallbackKey !== undefined) value = extracted[fallbackKey];
+          }
+          perProduct[v.name] = value !== undefined ? String(value) : '';
+        }
+        next[item.productName] = perProduct;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundleEntry?.tool_use_id, products?.length]);
+
   /* ── Send logic ── */
   async function dispatchMessage(userText: string, history: ChatEntry[]) {
     setSending(true);
@@ -207,10 +436,16 @@ export default function Home() {
     } catch { /* localStorage unavailable — skip */ }
 
     try {
+      const cartSummary = cartSummaryFrom(cartRef.current);
       const res = await fetch('/api/zolly', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: apiMessages, catalog: products ?? [], userProfile }),
+        body: JSON.stringify({
+          messages: apiMessages,
+          catalog: products ?? [],
+          userProfile,
+          cartSummary,
+        }),
       });
 
       const ct = res.headers.get('content-type') ?? '';
@@ -262,14 +497,57 @@ export default function Home() {
           setMandate(null);
 
           setEntries((prev) => {
-            const withoutOld = prev.filter((e) => e.kind !== 'tool_call');
+            const withoutOld = prev.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call');
             return [...withoutOld, { kind: 'tool_call', input: data.input, tool_use_id: data.tool_use_id }];
+          });
+        } else if (data.type === 'bundle_tool_call') {
+          const bundleInput = data.input as BundleToolCallInput;
+          const initialBundle: Record<string, Record<string, string>> = {};
+          for (const item of bundleInput.items) {
+            const matched = (products ?? []).find(
+              (p) => p.productName.toLowerCase() === item.productName.toLowerCase()
+            );
+            const extracted = (item.extracted_variables ?? {}) as Record<string, number>;
+            const perProduct: Record<string, string> = {};
+            if (matched) {
+              for (const v of matched.variables) {
+                let value: number | undefined = extracted[v.name];
+                if (value === undefined) {
+                  const fallbackKey = Object.keys(extracted).find(
+                    (k) =>
+                      k.toLowerCase().replace(/\s+/g, '_') === v.name.toLowerCase() ||
+                      k.toLowerCase() === v.label?.toLowerCase()
+                  );
+                  if (fallbackKey !== undefined) value = extracted[fallbackKey];
+                }
+                perProduct[v.name] = value !== undefined ? String(value) : '';
+              }
+            } else {
+              for (const [k, val] of Object.entries(extracted)) perProduct[k] = String(val);
+            }
+            initialBundle[item.productName] = perProduct;
+          }
+          setPendingBundleVars(initialBundle);
+          setPendingVars({});
+          setMandate(null);
+          setEntries((prev) => {
+            const withoutOld = prev.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call');
+            return [...withoutOld, { kind: 'bundle_tool_call', input: bundleInput, tool_use_id: data.tool_use_id }];
           });
         }
       } else {
         const text = await res.text();
         if (text.trim()) {
-          setEntries((prev) => [...prev, { kind: 'assistant', text }]);
+          const showCheckout =
+            cartRef.current.length > 0 && /ready to checkout/i.test(text);
+          setEntries((prev) => [
+            ...prev,
+            {
+              kind: 'assistant',
+              text,
+              ...(showCheckout ? { showCheckout: true as const } : {}),
+            },
+          ]);
         }
       }
     } catch (err) {
@@ -297,7 +575,7 @@ export default function Home() {
       }, 300);
     } else {
       // Already in chat — update state first, then trigger the side effect once.
-      const nextHistory: ChatEntry[] = [...entries, { kind: 'user', text: userText }];
+      const nextHistory: ChatEntry[] = [...stripCheckoutFlags(entries), { kind: 'user', text: userText }];
       setEntries(nextHistory);
       dispatchMessage(userText, nextHistory);
     }
@@ -348,11 +626,7 @@ export default function Home() {
         setError(data.error);
       } else {
         setMandate(data as Mandate);
-        setFlashActive(true);
-        setTimeout(() => {
-          setSheetOpen(true);
-          setFlashActive(false);
-        }, 150);
+        setSheetOpen(true);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -364,17 +638,9 @@ export default function Home() {
   async function handleLockIn() {
     if (!identifiedProduct) return;
     setError(null);
-    const vars: Record<string, number> = {};
+    let vars: Record<string, number>;
     try {
-      for (const v of identifiedProduct.variables) {
-        const raw = pendingVars[v.name];
-        if (raw === undefined || raw === '') {
-          throw new Error(`"${v.name}" is required`);
-        }
-        const n = Number(raw);
-        if (!Number.isFinite(n)) throw new Error(`"${v.name}" must be a number`);
-        vars[v.name] = n;
-      }
+      vars = buildVarsFromPending(identifiedProduct, pendingVars);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       return;
@@ -387,15 +653,286 @@ export default function Home() {
     }
   }
 
+  async function handleAddCurrentProductToCart() {
+    if (!identifiedProduct) return;
+    setError(null);
+    let vars: Record<string, number>;
+    try {
+      vars = buildVarsFromPending(identifiedProduct, pendingVars);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    setCalculating(true);
+    const userIdentity = readStoredUserIdentity();
+    let lockedPreview: Mandate | undefined;
+    try {
+      const res = await fetch('/api/mandate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          productId: identifiedProduct._id,
+          variables: vars,
+          user_identity: userIdentity,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setError(typeof data.error === 'string' ? data.error : 'Could not lock cart price');
+        return;
+      }
+      const preview = data as Mandate;
+      const li0 = preview.line_items[0];
+      if (li0?.total_minor == null) {
+        setError('Could not read mandate pricing for this item.');
+        return;
+      }
+      if (!preview.mandate_id || !preview.validity_window?.expires_at) {
+        setError('Mandate response missing id or expiry.');
+        return;
+      }
+      lockedPreview = preview;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    } finally {
+      setCalculating(false);
+    }
+    if (!lockedPreview) return;
+    const totalMinor = lockedPreview.line_items[0]!.total_minor;
+    const line: CartLine = {
+      id: crypto.randomUUID(),
+      productId: identifiedProduct._id,
+      productName: identifiedProduct.productName,
+      storeName: identifiedProduct.storeName,
+      storeLocation: identifiedProduct.storeLocation,
+      currency: identifiedProduct.currency,
+      unit: identifiedProduct.unit,
+      variables: vars,
+      lineTotal: totalMinor / 100,
+      mandateTotalMinor: totalMinor,
+      mandateId: lockedPreview.mandate_id,
+      expiresAt: lockedPreview.validity_window.expires_at,
+    };
+
+    setCart((prev) => {
+      const newCart = [...prev, line];
+      cartRef.current = newCart;
+      return newCart;
+    });
+    setMandate(null);
+    setSheetOpen(false);
+    setCartPanelOpen(false);
+    setPendingVars({});
+    const followUp = 'Item added. Continue with remaining products in the experience.';
+    const base = entries.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call');
+    const nextHistory: ChatEntry[] = [...base, { kind: 'user', text: followUp }];
+    setEntries(nextHistory);
+    await dispatchMessage(followUp, nextHistory);
+  }
+
+  async function handleAddBundleToCart() {
+    if (!bundleEntry) return;
+    setError(null);
+    const built: { id: string; productId: Id<'merchantProducts'>; productName: string; storeName: string; storeLocation: string; currency: string; unit: string; variables: Record<string, number> }[] = [];
+    try {
+      for (const { item, product } of bundleProducts) {
+        if (!product) {
+          throw new Error(`Product "${item.productName}" not in catalog yet.`);
+        }
+        const vars = buildVarsFromPending(product, pendingBundleVars[item.productName] ?? {});
+        built.push({
+          id: crypto.randomUUID(),
+          productId: product._id,
+          productName: product.productName,
+          storeName: product.storeName,
+          storeLocation: product.storeLocation,
+          currency: product.currency,
+          unit: product.unit,
+          variables: vars,
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+
+    setCalculating(true);
+    const userIdentity = readStoredUserIdentity();
+    let newLines: CartLine[];
+    try {
+      newLines = await Promise.all(
+        built.map(async (b) => {
+          const res = await fetch('/api/mandate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              productId: b.productId,
+              variables: b.variables,
+              user_identity: userIdentity,
+            }),
+          });
+          const data = await res.json();
+          if (data.error) {
+            throw new Error(typeof data.error === 'string' ? data.error : 'Could not lock cart price');
+          }
+          const preview = data as Mandate;
+          const li0 = preview.line_items[0];
+          if (li0?.total_minor == null) {
+            throw new Error('Could not read mandate pricing for this item.');
+          }
+          if (!preview.mandate_id || !preview.validity_window?.expires_at) {
+            throw new Error('Mandate response missing id or expiry.');
+          }
+          const tm = li0.total_minor;
+          return {
+            ...b,
+            lineTotal: tm / 100,
+            mandateTotalMinor: tm,
+            mandateId: preview.mandate_id,
+            expiresAt: preview.validity_window.expires_at,
+          };
+        })
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    } finally {
+      setCalculating(false);
+    }
+
+    setCart((prev) => {
+      const newCart = [...prev, ...newLines];
+      cartRef.current = newCart;
+      return newCart;
+    });
+    setMandate(null);
+    setSheetOpen(false);
+    setCartPanelOpen(false);
+    setPendingBundleVars({});
+    const followUp = 'Item added. Continue with remaining products in the experience.';
+    const base = entries.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call');
+    const nextHistory: ChatEntry[] = [...base, { kind: 'user', text: followUp }];
+    setEntries(nextHistory);
+    await dispatchMessage(followUp, nextHistory);
+  }
+
+  async function handleCheckoutAll() {
+    if (cart.length === 0) return;
+    const currencies = [...new Set(cart.map((c) => c.currency))];
+    if (currencies.length > 1) {
+      setError('Your cart mixes currencies. Remove items until only one currency remains.');
+      return;
+    }
+    setError(null);
+    setCalculating(true);
+
+    const userIdentity = readStoredUserIdentity();
+
+    try {
+      const res = await fetch('/api/mandate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: cart.map((c) => ({ productId: c.productId, variables: c.variables })),
+          bundleLabel: 'Your cart',
+          bundleName: `CART_${Date.now()}`,
+          user_identity: userIdentity,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setError(data.error);
+      } else {
+        setCart([]);
+        cartRef.current = [];
+        setCartPanelOpen(false);
+        setMandate(data as Mandate);
+        setSheetOpen(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCalculating(false);
+    }
+  }
+
+  function removeCartLine(id: string) {
+    setCart((prev) => prev.filter((l) => l.id !== id));
+  }
+
   function handleCancelConfirmation() {
     setEntries((prev) => [
-      ...prev.filter((e) => e.kind !== 'tool_call'),
+      ...prev.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call'),
       { kind: 'assistant', text: 'No problem — what would you like to change?' },
     ]);
     setPendingVars({});
+    setPendingBundleVars({});
     setMandate(null);
     setError(null);
     setTimeout(() => inputRef.current?.focus(), 0);
+  }
+
+  async function handleBundleLockIn() {
+    if (!bundleEntry) return;
+    setError(null);
+
+    const items: { productId: Id<'merchantProducts'>; variables: Record<string, number>; productName: string }[] = [];
+    try {
+      for (const { item, product } of bundleProducts) {
+        if (!product) {
+          throw new Error(`Product "${item.productName}" not in catalog yet.`);
+        }
+        const vars = buildVarsFromPending(product, pendingBundleVars[item.productName] ?? {});
+        items.push({ productId: product._id, variables: vars, productName: product.productName });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+
+    let userIdentity: { name: string; email: string; provider: string } | undefined;
+    try {
+      const identityRaw = localStorage.getItem('zolofy_identity');
+      const profileRaw  = localStorage.getItem('zolofy_profile');
+      const identity = identityRaw ? JSON.parse(identityRaw) : null;
+      const profile  = profileRaw  ? JSON.parse(profileRaw)  : null;
+      if (identity?.email || profile?.name) {
+        userIdentity = {
+          name:     profile?.name     ?? '',
+          email:    identity?.email   ?? '',
+          provider: identity?.provider ?? 'self-declared',
+        };
+      }
+    } catch { /* skip */ }
+
+    setLockingIn(true);
+    setCalculating(true);
+    try {
+      const res = await fetch('/api/mandate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bundle: true,
+          bundleName: bundleEntry.input.bundleName,
+          bundleLabel: bundleEntry.input.bundleLabel,
+          items,
+          user_identity: userIdentity,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setError(data.error);
+      } else {
+        setMandate(data as Mandate);
+        setSheetOpen(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCalculating(false);
+      setLockingIn(false);
+    }
   }
 
   function dismissSheet() {
@@ -409,8 +946,12 @@ export default function Home() {
       setMandate(null);
       setEntries([]);
       setPendingVars({});
+      setPendingBundleVars({});
       setError(null);
       setLockingIn(false);
+      setCart([]);
+      cartRef.current = [];
+      setCartPanelOpen(false);
       setOpacity(0);
       setTimeout(() => {
         setMode('landing');
@@ -420,6 +961,8 @@ export default function Home() {
   }
 
   const canSend = input.trim().length > 0 && !sending;
+
+  const cartCount = cart.length;
 
   /* ── Shared header ── */
   const header = (
@@ -434,30 +977,128 @@ export default function Home() {
       }}
     >
       <span style={{ fontSize: '18px', fontWeight: 600, color: '#5C4EFF', letterSpacing: '-0.01em' }}>Zolofy</span>
-      <Link
-        href="/merchant-lab"
-        style={{ fontSize: '13px', fontWeight: 500, color: TEXT_SECONDARY, textDecoration: 'none' }}
-      >
-        Merchant Lab →
-      </Link>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
+        {mode === 'chat' && (
+          <button
+            type="button"
+            onClick={() => setCartPanelOpen(true)}
+            aria-label={cartCount ? `Open cart, ${cartCount} items` : 'Open cart'}
+            style={{
+              position: 'relative',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 40,
+              height: 40,
+              borderRadius: 12,
+              border: `1px solid ${SEPARATOR}`,
+              background: '#FFFFFF',
+              cursor: 'pointer',
+              color: TEXT_PRIMARY,
+            }}
+          >
+            <ShoppingCart size={20} strokeWidth={2} aria-hidden />
+            {cartCount > 0 && (
+              <span
+                style={{
+                  position: 'absolute',
+                  top: -4,
+                  right: -4,
+                  minWidth: 18,
+                  height: 18,
+                  padding: '0 5px',
+                  borderRadius: 9,
+                  background: ACCENT,
+                  color: '#FFFFFF',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  lineHeight: 1,
+                }}
+              >
+                {cartCount > 99 ? '99+' : cartCount}
+              </span>
+            )}
+          </button>
+        )}
+        <Link
+          href="/merchant-lab"
+          style={{ fontSize: '13px', fontWeight: 500, color: TEXT_SECONDARY, textDecoration: 'none' }}
+        >
+          Merchant Lab →
+        </Link>
+      </div>
     </header>
   );
 
   /* ── Shared input bar ── */
+  // Typewriter placeholder phrases for landing
+  const PLACEHOLDER_PHRASES = [
+    'Plan a trip to Mauritius...',
+    'Charter a private jet from SF to Dubai...',
+    'Organise a corporate event for 100 people in Bangalore...',
+    'Renovate my living room with premium oak flooring...',
+  ];
+
+  const [placeholderIndex, setPlaceholderIndex] = useState(0);
+  const [placeholderText, setPlaceholderText] = useState('');
+  const [isTyping, setIsTyping] = useState(true);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
+
+  // Typewriter effect for landing placeholder
+  useEffect(() => {
+    if (mode !== 'landing' || inputFocused || input.length > 0) return;
+
+    const currentPhrase = PLACEHOLDER_PHRASES[placeholderIndex];
+    const CHAR_SPEED = 30; // ms per character
+    const PAUSE = 2000; // 2s pause
+
+    if (isTyping && !isDeleting) {
+      if (placeholderText.length < currentPhrase.length) {
+        const timeout = setTimeout(() => {
+          setPlaceholderText(currentPhrase.slice(0, placeholderText.length + 1));
+        }, CHAR_SPEED);
+        return () => clearTimeout(timeout);
+      } else {
+        // Finished typing, pause then start deleting
+        const timeout = setTimeout(() => setIsDeleting(true), PAUSE);
+        return () => clearTimeout(timeout);
+      }
+    }
+
+    if (isDeleting) {
+      if (placeholderText.length > 0) {
+        const timeout = setTimeout(() => {
+          setPlaceholderText(placeholderText.slice(0, -1));
+        }, CHAR_SPEED / 2);
+        return () => clearTimeout(timeout);
+      } else {
+        // Finished deleting, move to next phrase
+        setIsDeleting(false);
+        setPlaceholderIndex((prev) => (prev + 1) % PLACEHOLDER_PHRASES.length);
+      }
+    }
+  }, [mode, placeholderIndex, placeholderText, isTyping, isDeleting, inputFocused, input.length]);
+
   const inputBar = (isLanding: boolean) => (
     <form
       onSubmit={handleSubmit}
       style={{
         width: '100%',
-        maxWidth: isLanding ? 560 : '100%',
+        maxWidth: isLanding ? 600 : '100%',
         display: 'flex',
         alignItems: 'center',
-        height: 56,
-        background: '#FFFFFF',
+        height: isLanding ? 52 : 56,
+        background: isLanding ? 'rgba(255,255,255,0.8)' : '#FFFFFF',
+        backdropFilter: isLanding ? 'blur(12px)' : undefined,
+        WebkitBackdropFilter: isLanding ? 'blur(12px)' : undefined,
         border: `1px solid ${SEPARATOR}`,
-        borderRadius: 28,
-        boxShadow: '0 2px 20px rgba(0,0,0,0.08)',
-        padding: '0 8px 0 20px',
+        borderRadius: isLanding ? 12 : 28,
+        boxShadow: isLanding ? '0 4px 24px rgba(0,0,0,0.06)' : '0 2px 20px rgba(0,0,0,0.08)',
+        padding: isLanding ? '0 8px 0 16px' : '0 8px 0 20px',
       }}
     >
       <input
@@ -465,8 +1106,10 @@ export default function Home() {
         type="text"
         value={input}
         onChange={(e) => setInput(e.target.value)}
-        placeholder="Ask Zolly anything…"
+        placeholder={isLanding && !inputFocused && input.length === 0 ? placeholderText : 'Ask Zolly anything…'}
         disabled={sending}
+        onFocus={() => setInputFocused(true)}
+        onBlur={() => setInputFocused(false)}
         style={{
           flex: 1,
           height: '100%',
@@ -482,10 +1125,10 @@ export default function Home() {
         disabled={!canSend}
         style={{
           flexShrink: 0,
-          height: 40,
-          minWidth: 40,
-          padding: '0 18px',
-          borderRadius: 20,
+          height: isLanding ? 36 : 40,
+          minWidth: isLanding ? 36 : 40,
+          padding: isLanding ? '0 14px' : '0 18px',
+          borderRadius: isLanding ? 8 : 20,
           background: canSend ? ACCENT : SEPARATOR,
           color: canSend ? '#FFFFFF' : TEXT_SECONDARY,
           border: 'none',
@@ -508,7 +1151,9 @@ export default function Home() {
   /* ================================================================ */
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh' }}>
+    <>
+      <KeyframeStyles />
+      <div style={{ display: 'flex', minHeight: '100vh' }}>
       <NavSidebar />
       <div
         style={{
@@ -523,95 +1168,89 @@ export default function Home() {
       >
       {/* ── LANDING ── */}
       {mode === 'landing' && (
-        <>
+        <div className="relative flex min-h-[100dvh] flex-1 flex-col bg-white">
           {header}
           <main
+            className="z-landing-container"
             style={{
               flex: 1,
               display: 'flex',
               flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
-              padding: '0 24px 80px',
+              padding: '20px',
+              paddingBottom: 'max(96px, env(safe-area-inset-bottom, 0px))',
+              overflowY: 'auto',
+              background: '#FFFFFF',
             }}
           >
-            <h1
+            {/* Logo mark */}
+            <Image
+              src="/Z_ICON.png"
+              alt="Zolofy"
+              width={56}
+              height={56}
               style={{
-                fontSize: '32px',
-                fontWeight: 600,
-                color: TEXT_PRIMARY,
-                textAlign: 'center',
-                maxWidth: 480,
-                lineHeight: 1.25,
-                letterSpacing: '-0.02em',
                 marginBottom: 32,
+                borderRadius: 12,
+              }}
+            />
+
+            <h1
+              className="z-landing-headline"
+              style={{
+                fontSize: 'clamp(22px, 4vw, 28px)',
+                fontWeight: 300,
+                color: '#0A0A0A',
+                textAlign: 'center',
+                maxWidth: 520,
+                lineHeight: 1.3,
+                letterSpacing: '-0.01em',
+                marginBottom: 32,
+                fontFamily: "Inter, -apple-system, BlinkMacSystemFont, sans-serif",
               }}
             >
               What do you want to buy, book, or experience?
             </h1>
 
-            <div style={{ width: '100%', maxWidth: 560, marginBottom: 20 }}>
+            <div className="z-landing-search" style={{ width: '100%', maxWidth: 600, marginBottom: 24 }}>
               {inputBar(true)}
             </div>
 
-            {/* Category marquee */}
+            {/* Invitation chips */}
             <div
-              style={{
-                width: '100%',
-                maxWidth: 600,
-                overflow: 'hidden',
-                maskImage: 'linear-gradient(90deg, transparent, black 12%, black 88%, transparent)',
-                WebkitMaskImage: 'linear-gradient(90deg, transparent, black 12%, black 88%, transparent)',
-                marginTop: 8,
-              }}
+              className="z-landing-chips grid grid-cols-2 md:flex md:flex-row md:flex-wrap md:justify-center gap-3 w-full max-w-2xl mx-auto [&_button]:w-full md:[&_button]:w-auto"
             >
-              <div
-                className="z-marquee"
-                style={{ display: 'flex', gap: 10, width: 'max-content' }}
-              >
-                {[...CATEGORY_PILLS, ...CATEGORY_PILLS].map(({ icon, label, prompt }, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => handlePillClick(prompt)}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      padding: '10px 16px',
-                      borderRadius: 20,
-                      background: '#FFFFFF',
-                      border: '1px solid #E5E5EA',
-                      cursor: 'pointer',
-                      whiteSpace: 'nowrap',
-                      flexShrink: 0,
-                    }}
-                  >
-                    <img
-                      src={icon}
-                      width={20}
-                      height={20}
-                      alt=""
-                      style={{
-                        display: 'block',
-                        filter: 'invert(35%) sepia(98%) saturate(1000%) hue-rotate(230deg) brightness(0.9)',
-                      }}
-                    />
-                    <span
-                      style={{
-                        fontSize: '13px',
-                        color: '#0A0A0A',
-                        fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif",
-                      }}
-                    >
-                      {label}
-                    </span>
-                  </button>
-                ))}
-              </div>
+              {CATEGORY_PILLS.map((pill) => (
+                <InvitationChip
+                  key={pill.label}
+                  label={pill.label}
+                  onClick={() => handlePillClick(pill.label)}
+                />
+              ))}
             </div>
+
+            {/* WWDC-style tagline */}
+            <p className="mt-8 max-w-xl px-4 text-center text-[13px] font-medium leading-snug text-[#6C6C70]">
+              Meet Zolofy. The agentic commerce node.
+            </p>
           </main>
-        </>
+
+          <footer
+            className="pointer-events-none absolute bottom-6 left-0 right-0 flex w-full justify-center px-5"
+            aria-label="Open source notice"
+          >
+            <p className="pointer-events-auto max-w-lg text-center text-[11px] leading-relaxed tracking-wide text-[#8E8E93]">
+              Open-source UCP node under Apache 2.0. For collaborations:{' '}
+              <a
+                href="mailto:revanth@zolofy.co"
+                className="text-[#8E8E93] underline decoration-transparent underline-offset-2 transition-colors duration-150 hover:text-[#636366]"
+              >
+                revanth@zolofy.co
+              </a>
+            </p>
+          </footer>
+        </div>
       )}
 
       {/* ── CHAT ── */}
@@ -628,13 +1267,19 @@ export default function Home() {
               style={{
                 width: '28%',
                 flexShrink: 0,
-                background: CONTEXT_BG,
-                borderRight: `1px solid ${SEPARATOR}`,
+                background: 'rgba(255,255,255,0.6)',
+                backdropFilter: 'blur(20px)',
+                WebkitBackdropFilter: 'blur(20px)',
                 padding: 20,
                 overflowY: 'auto',
               }}
             >
-              {identifiedProduct ? (
+              {bundleEntry ? (
+                <BundleContextCard
+                  bundleLabel={bundleEntry.input.bundleLabel}
+                  items={bundleProducts}
+                />
+              ) : identifiedProduct ? (
                 <ProductContextCard product={identifiedProduct} />
               ) : (
                 <div
@@ -658,7 +1303,7 @@ export default function Home() {
                 flex: 1,
                 display: 'flex',
                 flexDirection: 'column',
-                background: '#FFFFFF',
+                background: '#F8F8FF',
                 overflow: 'hidden',
               }}
             >
@@ -679,19 +1324,24 @@ export default function Home() {
                   padding: '24px 28px',
                   display: 'flex',
                   flexDirection: 'column',
-                  gap: 16,
+                  gap: 12,
                 }}
               >
-                {entries.map((entry, i) => {
+                {entries.map((entry, i, arr) => {
+                  // Calculate gap to previous message of different kind (a "turn")
+                  const prevEntry = arr[i - 1];
+                  const isNewTurn = prevEntry && prevEntry.kind !== entry.kind;
+                  const marginTop = isNewTurn ? 24 : 0;
+
                   if (entry.kind === 'user') {
                     return (
-                      <div key={i} style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                      <div key={i} style={{ display: 'flex', justifyContent: 'flex-end', marginTop }}>
                         <div
                           style={{
                             maxWidth: '72%',
                             padding: '10px 16px',
-                            borderRadius: 18,
-                            background: ACCENT,
+                            borderRadius: '18px 18px 4px 18px',
+                            background: '#5C4EFF',
                             color: '#FFFFFF',
                             fontSize: '15px',
                             lineHeight: 1.45,
@@ -706,23 +1356,76 @@ export default function Home() {
                   }
 
                   if (entry.kind === 'assistant') {
+                    const showProceed = Boolean(entry.showCheckout && cart.length > 0);
+                    return (
+                      <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginTop }}>
+                        <ZollyAvatar />
+                        <div style={{ flex: 1, minWidth: 0, maxWidth: '80%' }}>
+                          <div
+                            style={{
+                              padding: '10px 16px',
+                              borderRadius: '18px 18px 18px 4px',
+                              background: 'rgba(255,255,255,0.75)',
+                              backdropFilter: 'blur(12px)',
+                              WebkitBackdropFilter: 'blur(12px)',
+                              border: '1px solid #E5E5EA',
+                              color: TEXT_PRIMARY,
+                              fontSize: '15px',
+                              lineHeight: 1.45,
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                            }}
+                          >
+                            <MarkdownText text={entry.text} />
+                          </div>
+                          {showProceed && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void handleCheckoutAll();
+                              }}
+                              disabled={calculating}
+                              style={{
+                                marginTop: 12,
+                                width: '100%',
+                                height: 48,
+                                fontSize: '15px',
+                                fontWeight: 600,
+                                borderRadius: 12,
+                                background: calculating ? SEPARATOR : ACCENT,
+                                color: calculating ? TEXT_SECONDARY : '#FFFFFF',
+                                border: 'none',
+                                cursor: calculating ? 'default' : 'pointer',
+                                letterSpacing: '-0.01em',
+                              }}
+                            >
+                              {calculating ? 'Preparing…' : 'Proceed to Checkout'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  if (entry.kind === 'bundle_tool_call') {
                     return (
                       <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
                         <ZollyAvatar />
-                        <div
-                          style={{
-                            maxWidth: '72%',
-                            padding: '10px 16px',
-                            borderRadius: 18,
-                            background: '#F4F4F5',
-                            color: TEXT_PRIMARY,
-                            fontSize: '15px',
-                            lineHeight: 1.45,
-                            whiteSpace: 'pre-wrap',
-                            wordBreak: 'break-word',
-                          }}
-                        >
-                          {entry.text}
+                        <div style={{ flex: 1, minWidth: 0, maxWidth: '80%' }}>
+                          <BundleConfirmationCard
+                            bundleLabel={entry.input.bundleLabel}
+                            items={bundleProducts}
+                            values={pendingBundleVars}
+                            onChange={setPendingBundleVars}
+                            onCheckoutNow={handleBundleLockIn}
+                            onAddAllToCart={() => {
+                              void handleAddBundleToCart();
+                            }}
+                            cartEmpty={cart.length === 0}
+                            onCancel={handleCancelConfirmation}
+                            lockingIn={lockingIn || calculating}
+                            mandate={mandate}
+                          />
                         </div>
                       </div>
                     );
@@ -738,7 +1441,11 @@ export default function Home() {
                           productName={entry.input.productName}
                           values={pendingVars}
                           onChange={setPendingVars}
-                          onLockIn={handleLockIn}
+                          onCheckoutNow={handleLockIn}
+                          onAddToCart={() => {
+                            void handleAddCurrentProductToCart();
+                          }}
+                          cartEmpty={cart.length === 0}
                           onCancel={handleCancelConfirmation}
                           lockingIn={lockingIn || calculating}
                           mandate={mandate}
@@ -750,13 +1457,16 @@ export default function Home() {
 
                 {/* Typing indicator */}
                 {sending && (
-                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginTop: 24 }}>
                     <ZollyAvatar pulse />
                     <div
                       style={{
                         padding: '10px 16px',
-                        borderRadius: 18,
-                        background: '#F4F4F5',
+                        borderRadius: '18px 18px 18px 4px',
+                        background: 'rgba(255,255,255,0.75)',
+                        backdropFilter: 'blur(12px)',
+                        WebkitBackdropFilter: 'blur(12px)',
+                        border: '1px solid #E5E5EA',
                         color: TEXT_SECONDARY,
                         fontSize: '15px',
                         fontStyle: 'italic',
@@ -798,18 +1508,15 @@ export default function Home() {
         </div>
       )}
 
-      {/* ── FLASH ── */}
-      <div
-        aria-hidden="true"
-        style={{
-          position: 'fixed',
-          inset: 0,
-          zIndex: 200,
-          background: '#FFFFFF',
-          opacity: flashActive ? 1 : 0,
-          transition: flashActive ? 'none' : 'opacity 150ms ease',
-          pointerEvents: 'none',
+      <CartSlidePanel
+        open={cartPanelOpen}
+        onClose={() => setCartPanelOpen(false)}
+        cart={cart}
+        onRemove={removeCartLine}
+        onCheckoutAll={() => {
+          void handleCheckoutAll();
         }}
+        checkoutLoading={calculating}
       />
 
       {/* ── MANDATE SHEET ── */}
@@ -823,12 +1530,29 @@ export default function Home() {
       )}
       </div>
     </div>
+    </>
   );
 }
 
 /* ------------------------------------------------------------------ */
 /*  Sub-components                                                    */
 /* ------------------------------------------------------------------ */
+
+function MarkdownText({ text }: { text: string }) {
+  // Simple markdown renderer for **bold** text
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return (
+    <>
+      {parts.map((part, i) => {
+        if (part.startsWith('**') && part.endsWith('**')) {
+          const content = part.slice(2, -2);
+          return <strong key={i} style={{ fontWeight: 600 }}>{content}</strong>;
+        }
+        return <span key={i}>{part}</span>;
+      })}
+    </>
+  );
+}
 
 function ZollyAvatar({ pulse = false }: { pulse?: boolean }) {
   return (
@@ -837,21 +1561,252 @@ function ZollyAvatar({ pulse = false }: { pulse?: boolean }) {
       className={pulse ? 'zolly-pulse zolly-shimmer' : ''}
       style={{
         flexShrink: 0,
-        width: 32,
-        height: 32,
-        borderRadius: 10,
+        width: 28,
+        height: 28,
+        borderRadius: 8,
         position: 'relative',
         overflow: 'hidden',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
       }}
     >
-      <img
-        src="/Z_ICON.png"
-        width={32}
-        height={32}
-        alt=""
-        style={{ display: 'block', width: 32, height: 32, borderRadius: 10 }}
-      />
+      <Image src="/Z_ICON.png" width={28} height={28} alt="" style={{ display: 'block' }} />
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Landing catalog card                                              */
+/* ------------------------------------------------------------------ */
+
+function LandingCatalogCard({
+  product,
+  onClick,
+}: {
+  product: Product;
+  onClick: () => void;
+}) {
+  const CategoryIcon = CATEGORY_ICONS[product.productCategory] ?? null;
+  const [hovered, setHovered] = useState(false);
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        width: '100%',
+        background: '#FFFFFF',
+        borderRadius: 14,
+        overflow: 'hidden',
+        border: `1px solid ${hovered ? ACCENT + '55' : SEPARATOR}`,
+        cursor: 'pointer',
+        textAlign: 'left',
+        padding: 0,
+        transition: 'border-color 150ms ease, box-shadow 150ms ease',
+        boxShadow: hovered ? '0 4px 16px rgba(92,78,255,0.12)' : '0 1px 4px rgba(0,0,0,0.04)',
+      }}
+    >
+      {/* Image or icon placeholder */}
+      {product.imageUrl ? (
+        <img
+          src={product.imageUrl}
+          alt={product.productName}
+          style={{ width: '100%', height: 96, objectFit: 'cover', display: 'block' }}
+        />
+      ) : (
+        <div
+          style={{
+            width: '100%',
+            height: 80,
+            background: PILL_BG,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          {CategoryIcon ? (
+            <CategoryIcon size={32} color={ACCENT} strokeWidth={1.5} />
+          ) : (
+            <span style={{ fontSize: '28px', fontWeight: 700, color: ACCENT }}>
+              {product.productCategory[0]}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Card body */}
+      <div style={{ padding: '10px 12px 12px' }}>
+        {/* Category + subcategory pills */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              height: 20,
+              padding: '0 7px',
+              borderRadius: 5,
+              background: PILL_BG,
+              color: ACCENT,
+              fontSize: '11px',
+              fontWeight: 500,
+            }}
+          >
+            {CategoryIcon && <CategoryIcon size={10} color={ACCENT} strokeWidth={2.5} />}
+            {product.productCategory}
+          </div>
+          {product.subCategory && (
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                height: 20,
+                padding: '0 7px',
+                borderRadius: 5,
+                background: '#F4F4F5',
+                color: TEXT_SECONDARY,
+                fontSize: '11px',
+                fontWeight: 400,
+              }}
+            >
+              {product.subCategory}
+            </div>
+          )}
+        </div>
+
+        {/* Product name */}
+        <div
+          style={{
+            fontSize: '13px',
+            fontWeight: 600,
+            color: TEXT_PRIMARY,
+            letterSpacing: '-0.01em',
+            marginBottom: 2,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {product.productName}
+        </div>
+
+        {/* Store */}
+        <div
+          style={{
+            fontSize: '11px',
+            color: TEXT_SECONDARY,
+            marginBottom: 8,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {product.storeName}
+          {product.storeLocation ? ` · ${product.storeLocation}` : ''}
+        </div>
+
+        {/* Price */}
+        <div
+          style={{
+            fontSize: '14px',
+            fontWeight: 700,
+            color: ACCENT,
+            letterSpacing: '-0.01em',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {product.currency} {product.baseRate.toLocaleString()}
+          <span style={{ fontSize: '11px', fontWeight: 400, color: TEXT_SECONDARY, marginLeft: 4 }}>
+            {product.unit}
+          </span>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Prompt chip (landing quick-start)                                 */
+/* ------------------------------------------------------------------ */
+
+const CHIP_ARROW = (
+  <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
+    <path
+      d="M1.5 5.5h8M6.5 2l3 3.5-3 3.5"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
+function PromptChip({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        height: 36,
+        padding: '0 14px',
+        borderRadius: 18,
+        background: CONTEXT_BG,
+        border: `1px solid ${SEPARATOR}`,
+        cursor: 'pointer',
+        fontSize: '13px',
+        fontWeight: 500,
+        color: TEXT_PRIMARY,
+        whiteSpace: 'nowrap',
+        transition: 'background 150ms ease, border-color 150ms ease',
+      }}
+    >
+      {label}
+      <span style={{ color: ACCENT, display: 'flex', alignItems: 'center' }}>
+        {CHIP_ARROW}
+      </span>
+    </button>
+  );
+}
+
+function InvitationChip({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        height: 34,
+        padding: '0 16px',
+        borderRadius: 17,
+        background: 'transparent',
+        border: `1px solid ${SEPARATOR}`,
+        cursor: 'pointer',
+        fontSize: '13px',
+        fontWeight: 400,
+        color: TEXT_SECONDARY,
+        whiteSpace: 'nowrap',
+        transition: 'all 150ms ease',
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.borderColor = ACCENT;
+        e.currentTarget.style.color = ACCENT;
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.borderColor = SEPARATOR;
+        e.currentTarget.style.color = TEXT_SECONDARY;
+      }}
+    >
+      {label}
+      <span style={{ display: 'flex', alignItems: 'center' }}>→</span>
+    </button>
   );
 }
 
@@ -860,16 +1815,15 @@ function ConfirmationRow({
   value,
   onChange,
   disabled,
-  index,
+  isLast,
 }: {
   variable: { name: string; label?: string; hint: string; min: number; max: number };
   value: string;
   onChange: (v: string) => void;
   disabled: boolean;
-  index: number;
+  isLast: boolean;
 }) {
   const [focused, setFocused] = useState(false);
-  const isEven = index % 2 === 0;
 
   return (
     <div
@@ -877,14 +1831,13 @@ function ConfirmationRow({
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 12,
-        padding: '12px 8px',
-        background: isEven ? CONTEXT_BG : '#FFFFFF',
-        borderRadius: 8,
+        justifyContent: 'space-between',
+        height: 44,
+        borderBottom: isLast ? 'none' : '1px solid #F2F2F7',
         overflow: 'hidden',
       }}
     >
-      <span style={{ fontSize: '13px', color: TEXT_SECONDARY, flexShrink: 0 }}>
+      <span style={{ fontSize: '14px', color: '#0A0A0A', flexShrink: 0 }}>
         {variable.label || variable.name}
       </span>
       <div
@@ -894,6 +1847,7 @@ function ConfirmationRow({
           minWidth: 0,
           display: 'flex',
           justifyContent: 'flex-end',
+          marginLeft: 16,
         }}
       >
         <div
@@ -901,7 +1855,7 @@ function ConfirmationRow({
             display: 'inline-flex',
             alignItems: 'center',
             maxWidth: '100%',
-            borderBottom: `1px solid ${focused ? ACCENT : 'transparent'}`,
+            borderBottom: `1px solid ${focused ? '#5C4EFF' : 'transparent'}`,
             transition: 'border-color 150ms ease',
           }}
         >
@@ -922,9 +1876,9 @@ function ConfirmationRow({
               width: '100%',
               maxWidth: '100%',
               padding: '2px 0',
-              fontSize: '15px',
+              fontSize: '14px',
               fontWeight: 600,
-              color: TEXT_PRIMARY,
+              color: '#0A0A0A',
               background: 'transparent',
               border: 'none',
               outline: 'none',
@@ -944,7 +1898,9 @@ function ConfirmationCard({
   productName,
   values,
   onChange,
-  onLockIn,
+  onCheckoutNow,
+  onAddToCart,
+  cartEmpty,
   onCancel,
   lockingIn,
   mandate,
@@ -953,7 +1909,9 @@ function ConfirmationCard({
   productName: string;
   values: Record<string, string>;
   onChange: (v: Record<string, string>) => void;
-  onLockIn: () => void;
+  onCheckoutNow: () => void;
+  onAddToCart?: () => void;
+  cartEmpty: boolean;
   onCancel: () => void;
   lockingIn: boolean;
   mandate: Mandate | null;
@@ -964,10 +1922,13 @@ function ConfirmationCard({
   return (
     <div
       style={{
-        background: '#FFFFFF',
-        border: `1px solid ${SEPARATOR}`,
-        borderRadius: 16,
+        background: 'rgba(255,255,255,0.85)',
+        backdropFilter: 'blur(20px)',
+        WebkitBackdropFilter: 'blur(20px)',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.6)',
+        borderRadius: 20,
         padding: 24,
+        animation: 'confirmCardIn 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards',
       }}
     >
       {/* Header */}
@@ -975,8 +1936,9 @@ function ConfirmationCard({
         style={{
           fontSize: '17px',
           fontWeight: 600,
-          color: TEXT_PRIMARY,
+          color: '#0A0A0A',
           letterSpacing: '-0.01em',
+          marginBottom: 4,
         }}
       >
         {productName}
@@ -984,22 +1946,21 @@ function ConfirmationCard({
       <div
         style={{
           fontSize: '13px',
-          color: TEXT_SECONDARY,
-          marginTop: 4,
-          marginBottom: product ? 18 : 0,
+          color: '#6C6C70',
+          marginBottom: product ? 16 : 0,
         }}
       >
-        Here&apos;s what I&apos;m locking in — tap any value to edit:
+        Here&apos;s what I&apos;m locking in
       </div>
 
       {!product ? (
-        <div style={{ fontSize: '14px', color: TEXT_SECONDARY, marginTop: 8 }}>
+        <div style={{ fontSize: '14px', color: '#6C6C70', marginTop: 8 }}>
           This product isn&apos;t in the catalog yet.
         </div>
       ) : (
         <>
-          {/* Inline-editable rows */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {/* Inline-editable rows — clean two-column, 44px height, divider */}
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
             {product.variables.map((v, i) => (
               <ConfirmationRow
                 key={v.name}
@@ -1007,45 +1968,79 @@ function ConfirmationCard({
                 value={values[v.name] ?? ''}
                 onChange={(next) => onChange({ ...values, [v.name]: next })}
                 disabled={primaryDisabled}
-                index={i}
+                isLast={i === product.variables.length - 1}
               />
             ))}
           </div>
 
-          {/* Primary: Lock it in */}
-          <button
-            onClick={onLockIn}
-            disabled={primaryDisabled}
-            className={lockingIn ? 'zolly-pulse' : ''}
-            style={{
-              marginTop: 20,
-              width: '100%',
-              height: 52,
-              fontSize: '16px',
-              fontWeight: 600,
-              borderRadius: 12,
-              background: primaryDisabled && !lockingIn ? SEPARATOR : ACCENT,
-              color: primaryDisabled && !lockingIn ? TEXT_SECONDARY : '#FFFFFF',
-              border: 'none',
-              cursor: primaryDisabled ? 'default' : 'pointer',
-              letterSpacing: '-0.01em',
-              transition: 'background 150ms ease-out, color 150ms ease-out',
-            }}
-          >
-            {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
-          </button>
+          {/* Lock it in + Add to Cart — side by side, equal width */}
+          <div style={{ display: 'flex', gap: 12, marginTop: 20 }}>
+            {onAddToCart && (
+              <button
+                type="button"
+                onClick={onAddToCart}
+                disabled={lockingIn || !product}
+                style={{
+                  flex: 1,
+                  height: 52,
+                  fontSize: '16px',
+                  fontWeight: 600,
+                  borderRadius: 12,
+                  background: '#FFFFFF',
+                  color: '#5C4EFF',
+                  border: '1px solid #5C4EFF',
+                  cursor: lockingIn || !product ? 'default' : 'pointer',
+                  letterSpacing: '-0.01em',
+                }}
+              >
+                Add to Cart
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onCheckoutNow}
+              disabled={primaryDisabled}
+              className={lockingIn ? 'zolly-pulse' : ''}
+              style={{
+                flex: 1,
+                height: 52,
+                fontSize: '16px',
+                fontWeight: 600,
+                borderRadius: 12,
+                background: primaryDisabled && !lockingIn ? '#E5E5EA' : '#5C4EFF',
+                color: primaryDisabled && !lockingIn ? '#6C6C70' : '#FFFFFF',
+                border: 'none',
+                cursor: primaryDisabled ? 'default' : 'pointer',
+                letterSpacing: '-0.01em',
+                transition: 'transform 80ms ease-out, background 150ms ease-out',
+              }}
+              onMouseDown={(e) => {
+                if (!primaryDisabled) {
+                  e.currentTarget.style.transform = 'scale(0.97)';
+                }
+              }}
+              onMouseUp={(e) => {
+                e.currentTarget.style.transform = 'scale(1)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.transform = 'scale(1)';
+              }}
+            >
+              {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
+            </button>
+          </div>
 
-          {/* Secondary: Cancel */}
+          {/* Cancel — plain text link */}
           <button
             onClick={onCancel}
             disabled={lockingIn}
             style={{
-              marginTop: 10,
+              marginTop: 16,
               width: '100%',
               height: 32,
               fontSize: '13px',
-              fontWeight: 500,
-              color: TEXT_SECONDARY,
+              fontWeight: 400,
+              color: '#6C6C70',
               background: 'transparent',
               border: 'none',
               cursor: lockingIn ? 'default' : 'pointer',
@@ -1060,143 +2055,371 @@ function ConfirmationCard({
   );
 }
 
+function BundleConfirmationCard({
+  bundleLabel,
+  items,
+  values,
+  onChange,
+  onCheckoutNow,
+  onAddAllToCart,
+  cartEmpty,
+  onCancel,
+  lockingIn,
+  mandate,
+}: {
+  bundleLabel: string;
+  items: { item: BundleToolCallInput['items'][number]; product: Product | null }[];
+  values: Record<string, Record<string, string>>;
+  onChange: (v: Record<string, Record<string, string>>) => void;
+  onCheckoutNow: () => void;
+  onAddAllToCart?: () => void;
+  cartEmpty: boolean;
+  onCancel: () => void;
+  lockingIn: boolean;
+  mandate: Mandate | null;
+}) {
+  const locked = !!mandate;
+  const primaryDisabled = lockingIn || locked;
+
+  const merchantNames = items
+    .map(({ product, item }) => product?.storeName ?? item.productName)
+    .filter((s, i, a) => a.indexOf(s) === i)
+    .join(' · ');
+
+  const baseTotal = items.reduce((acc, { product }) => acc + (product?.baseRate ?? 0), 0);
+  const currency = items.find(({ product }) => product)?.product?.currency ?? '';
+
+  return (
+    <div
+      style={{
+        background: 'rgba(255,255,255,0.85)',
+        backdropFilter: 'blur(20px)',
+        WebkitBackdropFilter: 'blur(20px)',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.6)',
+        borderRadius: 20,
+        padding: 24,
+        animation: 'confirmCardIn 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards',
+      }}
+    >
+      <div
+        style={{
+          fontSize: '17px',
+          fontWeight: 600,
+          color: '#0A0A0A',
+          letterSpacing: '-0.01em',
+          marginBottom: 4,
+        }}
+      >
+        {bundleLabel}
+      </div>
+      <div
+        style={{
+          fontSize: '13px',
+          color: '#6C6C70',
+          marginBottom: 16,
+        }}
+      >
+        {merchantNames}
+      </div>
+
+      {items.map(({ item, product }, idx) => (
+        <div key={item.productName + idx} style={{ marginBottom: idx === items.length - 1 ? 0 : 18 }}>
+          <div
+            style={{
+              fontSize: '15px',
+              fontWeight: 600,
+              color: '#5C4EFF',
+              letterSpacing: '-0.01em',
+              marginBottom: 8,
+            }}
+          >
+            {product?.productName ?? item.productName}
+          </div>
+          {!product ? (
+            <div style={{ fontSize: '13px', color: '#6C6C70' }}>
+              Not in catalog yet.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              {product.variables.map((v, i) => (
+                <ConfirmationRow
+                  key={v.name}
+                  variable={v}
+                  value={values[item.productName]?.[v.name] ?? ''}
+                  onChange={(next) =>
+                    onChange({
+                      ...values,
+                      [item.productName]: {
+                        ...(values[item.productName] ?? {}),
+                        [v.name]: next,
+                      },
+                    })
+                  }
+                  disabled={primaryDisabled}
+                  isLast={i === product.variables.length - 1}
+                />
+              ))}
+            </div>
+          )}
+          {idx !== items.length - 1 && (
+            <div style={{ height: 1, background: '#F2F2F7', marginTop: 18 }} />
+          )}
+        </div>
+      ))}
+
+      {/* Lock it in button — full width, 52px, #5C4EFF */}
+      <button
+        type="button"
+        onClick={onCheckoutNow}
+        disabled={primaryDisabled}
+        className={lockingIn ? 'zolly-pulse' : ''}
+        style={{
+          width: '100%',
+          height: 52,
+          fontSize: '16px',
+          fontWeight: 600,
+          borderRadius: 12,
+          background: primaryDisabled && !lockingIn ? '#E5E5EA' : '#5C4EFF',
+          color: primaryDisabled && !lockingIn ? '#6C6C70' : '#FFFFFF',
+          border: 'none',
+          cursor: primaryDisabled ? 'default' : 'pointer',
+          letterSpacing: '-0.01em',
+          transition: 'transform 80ms ease-out, background 150ms ease-out',
+          marginTop: 20,
+        }}
+        onMouseDown={(e) => {
+          if (!primaryDisabled) {
+            e.currentTarget.style.transform = 'scale(0.97)';
+          }
+        }}
+        onMouseUp={(e) => {
+          e.currentTarget.style.transform = 'scale(1)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.transform = 'scale(1)';
+        }}
+      >
+        {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
+      </button>
+
+      {onAddAllToCart && (
+        <button
+          type="button"
+          onClick={onAddAllToCart}
+          disabled={lockingIn || items.some(({ product }) => !product)}
+          style={{
+            width: '100%',
+            height: 44,
+            marginTop: 12,
+            fontSize: '16px',
+            fontWeight: 600,
+            borderRadius: 12,
+            background: '#FFFFFF',
+            color: '#5C4EFF',
+            border: '1px solid #5C4EFF',
+            cursor: lockingIn || items.some(({ product }) => !product) ? 'default' : 'pointer',
+            letterSpacing: '-0.01em',
+          }}
+        >
+          Add to Cart
+        </button>
+      )}
+
+      {/* Cancel — plain text link */}
+      <button
+        onClick={onCancel}
+        disabled={lockingIn}
+        style={{
+          marginTop: 12,
+          width: '100%',
+          height: 32,
+          fontSize: '13px',
+          fontWeight: 400,
+          color: '#6C6C70',
+          background: 'transparent',
+          border: 'none',
+          cursor: lockingIn ? 'default' : 'pointer',
+          textAlign: 'center',
+        }}
+      >
+        Cancel
+      </button>
+    </div>
+  );
+}
+
+function BundleContextCard({
+  bundleLabel,
+  items,
+}: {
+  bundleLabel: string;
+  items: { item: BundleToolCallInput['items'][number]; product: Product | null }[];
+}) {
+  return (
+    <div>
+      <div style={{ fontSize: '11px', fontWeight: 600, color: TEXT_SECONDARY, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 16 }}>
+        Bundle
+      </div>
+      <div
+        style={{
+          fontSize: '17px',
+          fontWeight: 600,
+          color: TEXT_PRIMARY,
+          letterSpacing: '-0.01em',
+          marginBottom: 14,
+        }}
+      >
+        {bundleLabel}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {items.map(({ item, product }, idx) => {
+          const CategoryIcon = product ? CATEGORY_ICONS[product.productCategory] ?? null : null;
+          return (
+            <div
+              key={item.productName + idx}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                background: '#FFFFFF',
+                borderRadius: 10,
+                padding: '10px 12px',
+                border: `1px solid ${SEPARATOR}`,
+              }}
+            >
+              <div
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 8,
+                  background: PILL_BG,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                {CategoryIcon ? (
+                  <CategoryIcon size={16} color={ACCENT} strokeWidth={2} />
+                ) : (
+                  <span style={{ fontSize: '13px', fontWeight: 700, color: ACCENT }}>
+                    {(product?.productCategory ?? item.productName)[0]}
+                  </span>
+                )}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div
+                  style={{
+                    fontSize: '13px',
+                    fontWeight: 600,
+                    color: TEXT_PRIMARY,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {product?.productName ?? item.productName}
+                </div>
+                <div
+                  style={{
+                    fontSize: '11px',
+                    color: TEXT_SECONDARY,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {product?.storeName ?? '—'}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ProductContextCard({ product }: { product: Product }) {
   const CategoryIcon = CATEGORY_ICONS[product.productCategory] ?? null;
 
   return (
     <div>
-      <div style={{ fontSize: '11px', fontWeight: 600, color: TEXT_SECONDARY, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 16 }}>
-        Product
-      </div>
+      {/* Product image or placeholder — full width, 180px, 16px radius, soft shadow */}
+      {product.imageUrl ? (
+        <img
+          src={product.imageUrl}
+          alt={product.productName}
+          style={{
+            display: 'block',
+            width: '100%',
+            height: 180,
+            objectFit: 'cover',
+            borderRadius: 16,
+            boxShadow: '0 4px 20px rgba(0,0,0,0.08)',
+            marginBottom: 16,
+          }}
+        />
+      ) : (
+        <div
+          style={{
+            width: '100%',
+            height: 180,
+            background: 'rgba(248,248,250,0.8)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            borderRadius: 16,
+            boxShadow: '0 4px 20px rgba(0,0,0,0.08)',
+            marginBottom: 16,
+            userSelect: 'none',
+          }}
+        >
+          {CategoryIcon ? (
+            <CategoryIcon size={64} color={ACCENT} strokeWidth={1.5} />
+          ) : (
+            <span style={{ fontSize: '56px', fontWeight: 700, color: ACCENT, letterSpacing: '-0.02em' }}>
+              {product.productCategory[0]}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Product name: 16px semibold */}
       <div
         style={{
-          background: '#FFFFFF',
-          borderRadius: 16,
-          overflow: 'hidden',
-          boxShadow: '0 1px 8px rgba(0,0,0,0.06)',
+          fontSize: '16px',
+          fontWeight: 600,
+          color: '#0A0A0A',
+          letterSpacing: '-0.01em',
+          marginBottom: 4,
+          fontFamily: "Inter, -apple-system, sans-serif",
         }}
       >
-        {/* Category pill + icon */}
-        <div style={{ padding: '16px 16px 0' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 5,
-                height: 24,
-                padding: '0 10px',
-                borderRadius: 8,
-                background: PILL_BG,
-                color: ACCENT,
-                fontSize: '12px',
-                fontWeight: 500,
-                letterSpacing: '0.01em',
-              }}
-            >
-              {CategoryIcon && (
-                <CategoryIcon size={12} color={ACCENT} strokeWidth={2.5} />
-              )}
-              {product.productCategory}
-            </div>
-          </div>
-        </div>
+        {product.productName}
+      </div>
 
-        {/* Product image or placeholder */}
-        {product.imageUrl ? (
-          <img
-            src={product.imageUrl}
-            alt={product.productName}
-            style={{
-              display: 'block',
-              width: '100%',
-              height: 160,
-              objectFit: 'cover',
-              borderRadius: 12,
-              boxShadow: '0 2px 12px rgba(0,0,0,0.10)',
-              margin: '0 0 12px',
-            }}
-          />
-        ) : (
-          <div
-            style={{
-              width: '100%',
-              height: 160,
-              background: PILL_BG,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              borderRadius: 12,
-              margin: '0 0 12px',
-              userSelect: 'none',
-            }}
-          >
-            {CategoryIcon ? (
-              <CategoryIcon size={56} color={ACCENT} strokeWidth={1.5} />
-            ) : (
-              <span style={{ fontSize: '48px', fontWeight: 700, color: ACCENT, letterSpacing: '-0.02em' }}>
-                {product.productCategory[0]}
-              </span>
-            )}
-          </div>
-        )}
+      {/* Store name: 12px #6C6C70 */}
+      <div style={{ fontSize: '12px', color: '#6C6C70', marginBottom: 12 }}>
+        {product.storeName}
+        {product.storeLocation ? ` · ${product.storeLocation}` : ''}
+      </div>
 
-        {/* Details body with watermark */}
-        <div style={{ padding: '0 16px 16px', position: 'relative', overflow: 'hidden' }}>
-          {/* Watermark icon */}
-          {CategoryIcon && (
-            <div
-              aria-hidden="true"
-              style={{
-                position: 'absolute',
-                bottom: -8,
-                right: -4,
-                opacity: 0.05,
-                pointerEvents: 'none',
-                lineHeight: 1,
-              }}
-            >
-              <CategoryIcon size={48} color={ACCENT} strokeWidth={1.5} />
-            </div>
-          )}
-
-          {/* Product name */}
-          <div
-            style={{
-              fontSize: '17px',
-              fontWeight: 600,
-              color: TEXT_PRIMARY,
-              letterSpacing: '-0.01em',
-              marginBottom: 4,
-              position: 'relative',
-            }}
-          >
-            {product.productName}
-          </div>
-
-          {/* Store */}
-          <div style={{ fontSize: '13px', color: TEXT_SECONDARY, marginBottom: 16, position: 'relative' }}>
-            {product.storeName}
-            {product.storeLocation ? ` · ${product.storeLocation}` : ''}
-          </div>
-
-          {/* Base price — most prominent */}
-          <div
-            style={{
-              fontSize: '24px',
-              fontWeight: 700,
-              color: ACCENT,
-              letterSpacing: '-0.02em',
-              fontVariantNumeric: 'tabular-nums',
-              position: 'relative',
-            }}
-          >
-            {product.currency} {product.baseRate.toLocaleString()}
-          </div>
-          <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginTop: 2, position: 'relative' }}>
-            {product.unit}
-          </div>
-        </div>
+      {/* Price: 22px #5C4EFF bold */}
+      <div
+        style={{
+          fontSize: '22px',
+          fontWeight: 700,
+          color: '#5C4EFF',
+          letterSpacing: '-0.02em',
+          fontVariantNumeric: 'tabular-nums',
+          fontFamily: "Inter, -apple-system, sans-serif",
+        }}
+      >
+        {product.currency} {product.baseRate.toLocaleString()}
+      </div>
+      <div style={{ fontSize: '11px', color: '#6C6C70', marginTop: 2 }}>
+        {product.unit}
       </div>
     </div>
   );
@@ -1409,7 +2632,7 @@ function NavSidebar() {
         src="/Z_ICON.png"
         width={28}
         height={28}
-        alt="Z"
+        alt=""
         className="rounded-xl"
         style={{ display: 'block', marginBottom: 28 }}
       />
@@ -1427,35 +2650,258 @@ function NavSidebar() {
         ))}
       </div>
 
-      {/* User avatar */}
-      <div
-        style={{
-          width: 32,
-          height: 32,
-          borderRadius: '50%',
-          background: ACCENT,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          color: '#FFFFFF',
-          fontSize: '14px',
-          fontWeight: 600,
-          userSelect: 'none',
-        }}
-        aria-label="User profile"
-      >
-        Z
+      <div style={{ marginTop: 'auto' }}>
+        <Image
+          src="/Z_ICON.png"
+          width={32}
+          height={32}
+          alt=""
+          className="rounded-xl"
+          style={{ display: 'block' }}
+        />
       </div>
     </nav>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/*  Mandate sheet                                                     */
+/*  Cart slide panel                                                  */
 /* ------------------------------------------------------------------ */
 
-const PAY_GRADIENT = `linear-gradient(135deg, ${ACCENT}, #00D4FF)`;
-const TOP_GRADIENT = `linear-gradient(90deg, ${ACCENT}, #00D4FF)`;
+function CartSlidePanel({
+  open,
+  onClose,
+  cart,
+  onRemove,
+  onCheckoutAll,
+  checkoutLoading,
+}: {
+  open: boolean;
+  onClose: () => void;
+  cart: CartLine[];
+  onRemove: (id: string) => void;
+  onCheckoutAll: () => void;
+  checkoutLoading: boolean;
+}) {
+  const currency = cart[0]?.currency ?? '';
+  const total = cart.reduce((s, c) => s + cartLineDisplayTotal(c), 0);
+
+  return (
+    <>
+      <div
+        onClick={open ? onClose : undefined}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0,0,0,0.35)',
+          zIndex: 90,
+          opacity: open ? 1 : 0,
+          transition: 'opacity 220ms ease',
+          pointerEvents: open ? 'auto' : 'none',
+        }}
+        aria-hidden={!open}
+      />
+      <aside
+        aria-hidden={!open}
+        aria-label="Shopping cart"
+        style={{
+          position: 'fixed',
+          top: 0,
+          right: 0,
+          bottom: 0,
+          width: 'min(420px, 100vw)',
+          background: '#FFFFFF',
+          boxShadow: open ? '-8px 0 40px rgba(0,0,0,0.14)' : 'none',
+          zIndex: 95,
+          display: 'flex',
+          flexDirection: 'column',
+          transform: open ? 'translateX(0)' : 'translateX(100%)',
+          transition: 'transform 280ms cubic-bezier(0.32, 0.72, 0, 1)',
+          pointerEvents: open ? 'auto' : 'none',
+        }}
+      >
+        <div
+          style={{
+            padding: '20px 22px 16px',
+            borderBottom: `1px solid ${SEPARATOR}`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ fontSize: '18px', fontWeight: 600, color: TEXT_PRIMARY, letterSpacing: '-0.02em' }}>
+            Cart
+          </span>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close cart"
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: '50%',
+              border: 'none',
+              background: '#F4F4F5',
+              cursor: 'pointer',
+              fontSize: 20,
+              color: TEXT_SECONDARY,
+              lineHeight: 1,
+            }}
+          >
+            ×
+          </button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 22px' }}>
+          {cart.length === 0 ? (
+            <p style={{ fontSize: '14px', color: TEXT_SECONDARY, margin: 0, lineHeight: 1.5 }}>
+              Your cart is empty. Confirm a product with Zolly and tap &quot;Add to Cart&quot;.
+            </p>
+          ) : (
+            <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {cart.map((line) => (
+                <li
+                  key={line.id}
+                  style={{
+                    display: 'flex',
+                    gap: 12,
+                    alignItems: 'flex-start',
+                    padding: 14,
+                    borderRadius: 14,
+                    border: `1px solid ${SEPARATOR}`,
+                    background: '#FAFAFA',
+                  }}
+                >
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div
+                      style={{
+                        fontSize: '14px',
+                        fontWeight: 600,
+                        color: TEXT_PRIMARY,
+                        marginBottom: 4,
+                        lineHeight: 1.35,
+                      }}
+                    >
+                      {line.productName}
+                    </div>
+                    <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginBottom: 6 }}>
+                      {line.storeName}
+                      {line.storeLocation ? ` · ${line.storeLocation}` : ''}
+                    </div>
+                    <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginBottom: 8 }}>
+                      <span style={{ fontWeight: 600, color: TEXT_PRIMARY }}>Mandate</span>{' '}
+                      <span
+                        style={{
+                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                          fontSize: '11px',
+                          wordBreak: 'break-all',
+                        }}
+                      >
+                        {line.mandateId}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginBottom: 8 }}>
+                      <span style={{ fontWeight: 600 }}>Expires</span> {formatCartMandateExpiry(line.expiresAt)}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: '15px',
+                        fontWeight: 700,
+                        color: ACCENT,
+                        fontVariantNumeric: 'tabular-nums',
+                        lineHeight: 1.35,
+                      }}
+                    >
+                      {line.currency} {cartLineDisplayTotal(line).toLocaleString()}{' '}
+                      <span style={{ fontSize: '13px', fontWeight: 600, color: TEXT_PRIMARY }}>total</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRemove(line.id)}
+                    aria-label={`Remove ${line.productName}`}
+                    style={{
+                      flexShrink: 0,
+                      width: 36,
+                      height: 36,
+                      borderRadius: 10,
+                      border: `1px solid ${SEPARATOR}`,
+                      background: '#FFFFFF',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      color: TEXT_SECONDARY,
+                    }}
+                  >
+                    <Trash2 size={16} strokeWidth={2} aria-hidden />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div
+          style={{
+            padding: '16px 22px 24px',
+            borderTop: `1px solid ${SEPARATOR}`,
+            flexShrink: 0,
+            background: '#FFFFFF',
+          }}
+        >
+          {cart.length > 0 && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'baseline',
+                justifyContent: 'space-between',
+                marginBottom: 14,
+              }}
+            >
+              <span style={{ fontSize: '14px', color: TEXT_SECONDARY, fontWeight: 600 }}>Cart Total</span>
+              <span
+                style={{
+                  fontSize: '20px',
+                  fontWeight: 700,
+                  color: TEXT_PRIMARY,
+                  fontVariantNumeric: 'tabular-nums',
+                }}
+              >
+                {currency} {total.toLocaleString()}
+              </span>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={onCheckoutAll}
+            disabled={cart.length === 0 || checkoutLoading}
+            className={checkoutLoading ? 'zolly-pulse' : ''}
+            style={{
+              width: '100%',
+              height: 52,
+              fontSize: '16px',
+              fontWeight: 600,
+              borderRadius: 12,
+              background: cart.length === 0 || checkoutLoading ? SEPARATOR : ACCENT,
+              color: cart.length === 0 || checkoutLoading ? TEXT_SECONDARY : '#FFFFFF',
+              border: 'none',
+              cursor: cart.length === 0 || checkoutLoading ? 'default' : 'pointer',
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {checkoutLoading ? 'Preparing checkout…' : 'Checkout All'}
+          </button>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mandate sheet                                                     */
+/* ------------------------------------------------------------------ */
 
 function useCountUp(target: number, running: boolean, durationMs = 800) {
   const [value, setValue] = useState(0);
@@ -1490,6 +2936,8 @@ function MandateSheet({
   const [now, setNow] = useState(() => Date.now());
   const [paid, setPaid] = useState(false);
   const [contentOpacity, setContentOpacity] = useState(1);
+  const [showDetails, setShowDetails] = useState(false);
+  const [payPressed, setPayPressed] = useState(false);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -1501,6 +2949,7 @@ function MandateSheet({
     if (!open) {
       setPaid(false);
       setContentOpacity(1);
+      setShowDetails(false);
     }
   }, [open]);
 
@@ -1512,16 +2961,32 @@ function MandateSheet({
 
   const price    = mandate.total.amount_minor / 100;
   const currency = mandate.total.currency;
-  const productName = mandate.line_items[0]?.name ?? '';
+  const isBundle = mandate.bundle === true;
+  const productName = isBundle
+    ? (mandate.bundle_label ?? 'Bundle')
+    : (mandate.line_items[0]?.name ?? '');
+
+  const uniqueMerchantCount = useMemo(() => {
+    if (!isBundle || mandate.line_items.length === 0) return 0;
+    const names = mandate.line_items
+      .map((li) => li.storeName)
+      .filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
+    const n = new Set(names).size;
+    return Math.max(n, 1);
+  }, [isBundle, mandate.line_items]);
 
   const displayPrice = useCountUp(price, open && !paid);
 
   function handlePay() {
-    setContentOpacity(0);
+    setPayPressed(true);
     setTimeout(() => {
-      setPaid(true);
-      setContentOpacity(1);
-    }, 300);
+      setPayPressed(false);
+      setContentOpacity(0);
+      setTimeout(() => {
+        setPaid(true);
+        setContentOpacity(1);
+      }, 200);
+    }, 80);
   }
 
   return (
@@ -1539,7 +3004,7 @@ function MandateSheet({
         style={{
           position: 'absolute',
           inset: 0,
-          background: 'rgba(0,0,0,0.4)',
+          background: 'rgba(0,0,0,0.22)',
           opacity: open ? 1 : 0,
           transition: 'opacity 200ms ease',
         }}
@@ -1554,12 +3019,15 @@ function MandateSheet({
           right: 0,
           transform: open ? 'translateY(0)' : 'translateY(100%)',
           transition: 'transform 300ms cubic-bezier(0.32, 0.72, 0, 1)',
-          background: '#FFFFFF',
+          background: 'rgba(255,255,255,0.92)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
           borderRadius: '24px 24px 0 0',
           overflow: 'hidden',
-          maxHeight: '92vh',
+          maxHeight: '78vh',
           display: 'flex',
           flexDirection: 'column',
+          boxShadow: '0 -4px 32px rgba(0,0,0,0.12)',
         }}
       >
         {/* 3px gradient top border */}
@@ -1575,83 +3043,118 @@ function MandateSheet({
           }}
         >
           {paid ? (
-            /* ── Success state ── */
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', paddingTop: 8, paddingBottom: 8 }}>
-              {/* Green checkmark */}
+            /* ── Quote Accepted state ── */
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', paddingTop: 8, paddingBottom: 8, width: '100%' }}>
+              {/* #5C4EFF checkmark circle with pulse */}
               <div
                 style={{
-                  width: 72,
-                  height: 72,
+                  width: 64,
+                  height: 64,
                   borderRadius: '50%',
-                  background: '#DCFCE7',
+                  background: '#5C4EFF',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  fontSize: '36px',
-                  color: '#16A34A',
-                  marginBottom: 20,
+                  fontSize: '32px',
+                  color: '#FFFFFF',
+                  margin: '0 auto 20px',
+                  animation: 'checkPulse 600ms ease-out forwards',
                 }}
               >
                 ✓
               </div>
 
-              {/* Quote Accepted */}
-              <div style={{ fontSize: '24px', fontWeight: 600, color: TEXT_PRIMARY, letterSpacing: '-0.02em', marginBottom: 8 }}>
+              <div style={{ fontSize: '28px', fontWeight: 600, color: '#0A0A0A', letterSpacing: '-0.02em', marginBottom: 24 }}>
                 Quote Accepted
               </div>
 
-              {/* Product name */}
-              <div style={{ fontSize: '14px', color: TEXT_SECONDARY, marginBottom: 4 }}>
-                {productName}
+              {/* Line items — clean grid */}
+              <div style={{ width: '100%', marginBottom: 16 }}>
+                {mandate.line_items.map((li, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      height: 44,
+                      borderBottom: i < mandate.line_items.length - 1 ? '1px solid #F2F2F7' : 'none',
+                    }}
+                  >
+                    <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                      <div style={{ fontSize: '14px', fontWeight: 500, color: '#0A0A0A' }}>{li.name}</div>
+                      {li.storeName ? (
+                        <div style={{ fontSize: '12px', color: '#6C6C70' }}>{li.storeName}</div>
+                      ) : null}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: '14px',
+                        fontWeight: 600,
+                        color: '#0A0A0A',
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      {currency} {(li.total_minor / 100).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
               </div>
 
-              {/* Final price */}
+              {/* Total row */}
               <div
                 style={{
-                  fontSize: '20px',
-                  fontWeight: 600,
-                  color: TEXT_PRIMARY,
-                  letterSpacing: '-0.02em',
-                  fontVariantNumeric: 'tabular-nums',
-                  marginBottom: 16,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  height: 44,
+                  width: '100%',
+                  borderTop: '1px solid #E5E5EA',
+                  marginBottom: 12,
                 }}
               >
-                {currency} {price.toLocaleString()}
+                <span style={{ fontSize: '15px', fontWeight: 600, color: '#0A0A0A' }}>Total</span>
+                <span
+                  style={{
+                    fontSize: '22px',
+                    fontWeight: 600,
+                    color: '#0A0A0A',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  {currency} {price.toLocaleString()}
+                </span>
               </div>
 
-              {/* Confirmation message */}
-              <div style={{ fontSize: '13px', color: TEXT_SECONDARY, marginBottom: 12 }}>
-                Your mandate has been recorded.
-              </div>
-
-              {/* Mandate ID */}
+              {/* Mandate ID — monospace 11px #6C6C70 centered */}
               <div
                 style={{
                   fontSize: '11px',
                   fontFamily: 'monospace',
-                  color: '#9CA3AF',
+                  color: '#6C6C70',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
                   width: '100%',
-                  marginBottom: 28,
+                  marginBottom: 24,
+                  textAlign: 'center',
                 }}
               >
                 {mandate.mandate_id}
               </div>
 
-              {/* Start New button */}
+              {/* Start New — full width outline button, #5C4EFF */}
               <button
                 onClick={onStartOver}
                 style={{
                   width: '100%',
-                  height: 48,
+                  height: 52,
                   fontSize: '15px',
                   fontWeight: 500,
                   borderRadius: 12,
                   background: 'transparent',
-                  color: ACCENT,
-                  border: `1.5px solid ${ACCENT}`,
+                  color: '#5C4EFF',
+                  border: '1px solid #5C4EFF',
                   cursor: 'pointer',
                   letterSpacing: '-0.01em',
                 }}
@@ -1691,32 +3194,33 @@ function MandateSheet({
               <div
                 style={{
                   fontSize: '13px',
-                  color: TEXT_SECONDARY,
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.08em',
-                  marginBottom: 8,
+                  color: '#6C6C70',
+                  marginBottom: 32,
                 }}
               >
                 {productName}
               </div>
 
-              {/* Price */}
+              {/* Price - 48px weight 200, large, calm, confident */}
               <div
                 style={{
                   fontSize: '48px',
-                  fontWeight: 600,
-                  color: TEXT_PRIMARY,
+                  fontWeight: 200,
+                  color: '#0A0A0A',
                   letterSpacing: '-0.03em',
                   fontVariantNumeric: 'tabular-nums',
-                  lineHeight: 1.1,
-                  marginBottom: 20,
+                  lineHeight: 1.05,
+                  textAlign: 'center',
+                  marginTop: 32,
+                  marginBottom: 32,
+                  fontFamily: "Inter, -apple-system, sans-serif",
                 }}
               >
                 {currency} {displayPrice.toLocaleString()}
               </div>
 
-              {/* Validity pill */}
-              <div style={{ marginBottom: 20 }}>
+              {/* Validity pill — #F2F2F7 background with clock icon */}
+              <div style={{ marginBottom: 20, textAlign: 'center' }}>
                 <div
                   style={{
                     display: 'inline-flex',
@@ -1724,72 +3228,217 @@ function MandateSheet({
                     gap: 6,
                     height: 32,
                     padding: '0 14px',
-                    borderRadius: 20,
-                    background: '#EEF0FF',
-                    color: '#5C4EFF',
+                    borderRadius: 16,
+                    background: '#F2F2F7',
+                    color: '#6C6C70',
                     fontSize: '13px',
                     fontWeight: 500,
                     fontVariantNumeric: 'tabular-nums',
                   }}
                 >
-                  <span aria-hidden="true">⏱</span>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10"/>
+                    <polyline points="12,6 12,12 16,14"/>
+                  </svg>
                   <span>Locked for {countdown}</span>
                 </div>
               </div>
 
-              {/* AP2 mandate ID */}
-              <div
+              {/* Show details link */}
+              <button
+                onClick={() => setShowDetails(!showDetails)}
                 style={{
-                  fontSize: '11px',
-                  fontFamily: 'monospace',
-                  color: '#9CA3AF',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
+                  fontSize: '12px',
+                  color: '#5C4EFF',
+                  background: 'transparent',
+                  border: 'none',
+                  cursor: 'pointer',
                   marginBottom: 28,
+                  padding: 0,
                 }}
               >
-                {mandate.mandate_id}
-              </div>
+                {showDetails ? 'Hide details' : 'Show details'}
+              </button>
 
-              {/* Pay buttons — Apple Pay and Google Pay side by side */}
+              {/* Expanded details */}
+              {showDetails && (
+                <div
+                  style={{
+                    animation: 'detailsExpand 200ms ease-out forwards',
+                    marginBottom: 24,
+                  }}
+                >
+                  {/* Multi-item line breakdown (bundle / cart checkout) */}
+                  {isBundle && (
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 12,
+                        marginBottom: 14,
+                        padding: '12px 0',
+                        borderTop: `1px solid ${SEPARATOR}`,
+                        borderBottom: `1px solid ${SEPARATOR}`,
+                      }}
+                    >
+                      {mandate.line_items.map((li, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'flex-start',
+                            gap: 16,
+                          }}
+                        >
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              style={{
+                                fontSize: '14px',
+                                fontWeight: 600,
+                                color: TEXT_PRIMARY,
+                                lineHeight: 1.35,
+                              }}
+                            >
+                              {li.name}
+                            </div>
+                            {li.storeName ? (
+                              <div
+                                style={{
+                                  fontSize: '12px',
+                                  color: TEXT_SECONDARY,
+                                  marginTop: 2,
+                                }}
+                              >
+                                {li.storeName}
+                              </div>
+                            ) : null}
+                          </div>
+                          <span
+                            style={{
+                              fontSize: '14px',
+                              fontWeight: 600,
+                              color: TEXT_PRIMARY,
+                              fontVariantNumeric: 'tabular-nums',
+                              flexShrink: 0,
+                            }}
+                          >
+                            {currency} {(li.total_minor / 100).toLocaleString()}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Single item details */}
+                  {!isBundle && mandate.line_items[0] && (
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'flex-start',
+                        gap: 16,
+                        marginBottom: 14,
+                        padding: '12px 0',
+                        borderTop: `1px solid ${SEPARATOR}`,
+                        borderBottom: `1px solid ${SEPARATOR}`,
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div
+                          style={{
+                            fontSize: '14px',
+                            fontWeight: 600,
+                            color: TEXT_PRIMARY,
+                            lineHeight: 1.35,
+                          }}
+                        >
+                          {mandate.line_items[0].name}
+                        </div>
+                        {mandate.merchant?.name ? (
+                          <div
+                            style={{
+                              fontSize: '12px',
+                              color: TEXT_SECONDARY,
+                              marginTop: 2,
+                            }}
+                          >
+                            {mandate.merchant.name}
+                          </div>
+                        ) : null}
+                      </div>
+                      <span
+                        style={{
+                          fontSize: '14px',
+                          fontWeight: 600,
+                          color: TEXT_PRIMARY,
+                          fontVariantNumeric: 'tabular-nums',
+                          flexShrink: 0,
+                        }}
+                      >
+                        {currency} {(mandate.line_items[0].total_minor / 100).toLocaleString()}
+                      </span>
+                    </div>
+                  )}
+
+                  {/* AP2 mandate ID */}
+                  <div
+                    style={{
+                      fontSize: '11px',
+                      fontFamily: 'monospace',
+                      color: '#9CA3AF',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {mandate.mandate_id}
+                  </div>
+                </div>
+              )}
+
+              {/* Pay buttons — Apple Pay (black) + Google Pay (white) side by side, 52px height, 12px radius */}
               <div style={{ display: 'flex', gap: 12 }}>
-                {/* Apple Pay button */}
+                {/* Apple Pay button — black background, white text */}
                 <button
                   onClick={handlePay}
                   style={{
                     flex: 1,
-                    height: 56,
+                    height: 52,
                     fontSize: '16px',
                     fontWeight: 600,
-                    borderRadius: 14,
-                    background: 'linear-gradient(135deg, #5C4EFF, #00D4FF)',
+                    borderRadius: 12,
+                    background: '#0A0A0A',
                     color: '#FFFFFF',
                     border: 'none',
                     cursor: 'pointer',
                     letterSpacing: '-0.01em',
+                    transform: payPressed ? 'scale(0.97)' : 'scale(1)',
+                    transition: 'transform 80ms ease-out',
                   }}
                 >
-                  Pay with Apple Pay
+                  Apple Pay
                 </button>
 
-                {/* Google Pay button */}
+                {/* Google Pay button — white background, #0A0A0A text, 1px border */}
                 <button
                   onClick={handlePay}
                   style={{
                     flex: 1,
-                    height: 56,
+                    height: 52,
                     fontSize: '16px',
                     fontWeight: 600,
-                    borderRadius: 14,
-                    background: 'linear-gradient(135deg, #1F2937, #374151)',
-                    color: '#FFFFFF',
-                    border: 'none',
+                    borderRadius: 12,
+                    background: '#FFFFFF',
+                    color: '#0A0A0A',
+                    border: '1px solid #E5E5EA',
                     cursor: 'pointer',
                     letterSpacing: '-0.01em',
+                    transform: payPressed ? 'scale(0.97)' : 'scale(1)',
+                    transition: 'transform 80ms ease-out',
                   }}
                 >
-                  Pay with Google Pay
+                  Google Pay
                 </button>
               </div>
             </>

@@ -30,6 +30,7 @@ type Product = {
   storeLocation: string;
   productName: string;
   productCategory: string;
+  subCategory?: string;
   unit: string;
   baseRate: number;
   currency: string;
@@ -77,8 +78,12 @@ function categoryPalette(category: string) {
 }
 
 const CATEGORIES = [
-  'Automotive', 'Travel', 'Catering', 'Events', 'Printing',
-  'Interiors', 'Photography', 'Fitness', 'Legal', 'Renovation',
+  'Luxury Rentals',
+  'Trip Planning',
+  'Event Management',
+  'Renovation',
+  'Catering',
+  'Printing & Branding',
 ];
 
 const ROLES = ['time', 'quantity', 'dimension'];
@@ -213,6 +218,7 @@ export default function MerchantLab() {
   const [storeLocation, setStoreLocation] = useState('');
   const [productName, setProductName] = useState('');
   const [productCategory, setProductCategory] = useState(CATEGORIES[0]);
+  const [subCategory, setSubCategory] = useState('');
   const [unit, setUnit] = useState('');
   const [baseRate, setBaseRate] = useState('');
   const [currency, setCurrency] = useState('USD');
@@ -271,6 +277,7 @@ export default function MerchantLab() {
     setStoreLocation(product.storeLocation);
     setProductName(product.productName);
     setProductCategory(product.productCategory);
+    setSubCategory(product.subCategory ?? '');
     setUnit(product.unit);
     setBaseRate(String(product.baseRate));
     setCurrency(product.currency);
@@ -306,6 +313,7 @@ export default function MerchantLab() {
     setStoreLocation('');
     setProductName('');
     setProductCategory(CATEGORIES[0]);
+    setSubCategory('');
     setUnit('');
     setBaseRate('');
     setCurrency('USD');
@@ -374,6 +382,7 @@ export default function MerchantLab() {
       storeLocation: storeLocation.trim(),
       productName: productName.trim(),
       productCategory,
+      subCategory: subCategory.trim() || undefined,
       unit: unit.trim(),
       baseRate: rate,
       currency: currency.trim() || 'USD',
@@ -405,6 +414,7 @@ export default function MerchantLab() {
       setStoreLocation('');
       setProductName('');
       setProductCategory(CATEGORIES[0]);
+      setSubCategory('');
       setUnit('');
       setBaseRate('');
       setCurrency('USD');
@@ -659,6 +669,16 @@ export default function MerchantLab() {
                       />
                     </Field>
                   </div>
+
+                  {/* Subcategory — free text */}
+                  <Field label="Subcategory (optional)">
+                    <input
+                      style={fieldStyle}
+                      value={subCategory}
+                      onChange={(e) => setSubCategory(e.target.value)}
+                      placeholder="e.g. Car Rentals, Yacht Rentals, Hotel Stay"
+                    />
+                  </Field>
 
                   {/* Base rate + Currency */}
                   <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12 }}>
@@ -1094,20 +1114,39 @@ function LabProductCard({
       }}
     >
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
-        <div
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            height: 22,
-            padding: '0 8px',
-            borderRadius: 6,
-            background: palette.bg,
-            color: palette.text,
-            fontSize: '12px',
-            fontWeight: 500,
-          }}
-        >
-          {product.productCategory}
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              height: 22,
+              padding: '0 8px',
+              borderRadius: 6,
+              background: palette.bg,
+              color: palette.text,
+              fontSize: '12px',
+              fontWeight: 500,
+            }}
+          >
+            {product.productCategory}
+          </div>
+          {product.subCategory && (
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                height: 22,
+                padding: '0 8px',
+                borderRadius: 6,
+                background: COLORS.bg,
+                color: COLORS.secondary,
+                fontSize: '12px',
+                fontWeight: 400,
+              }}
+            >
+              {product.subCategory}
+            </div>
+          )}
         </div>
 
         {/* Edit + Delete button group */}
