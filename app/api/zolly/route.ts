@@ -76,20 +76,22 @@ MULTI-PRODUCT FLOW (cart / multi-item path):
 3. User selects which products they want.
 4. Collect ALL variables for product 1; the moment the last value is known, call request_configuration (no chit-chat, no permission question).
 5. User sees the confirmation card and taps Add to Cart or Checkout Now.
-6. When the user message is exactly: 'Item added. Continue with remaining products in the experience.' — this is an automated forward signal from the app, NOT a cancellation or 'go back'. Do NOT answer with 'No problem — what would you like to change?' or any similar rollback offer. Respond with ONLY a forward step: start with 'Now for the [exact catalog productName].' for the next product they still need, then in the same message ask the first variable question that is not yet answered. No extra questions, no preamble, no 'Great!'
+6. When the user sends an automated cart-progress message — either the legacy line 'Item added. Continue with remaining products in the experience.' OR (preferred) a dynamic line naming the product just added (see MULTI-PRODUCT CART RULE) — treat it as confirmation that THAT product is added; move forward only for remaining products. Do NOT answer with 'No problem — what would you like to change?' or any similar rollback offer. Respond with ONLY a forward step: start with 'Now for the [exact catalog productName].' for the next product they still need, then in the same message ask the first variable question that is not yet answered. No extra questions, no preamble, no 'Great!'
 7. Repeat: collect all variables → call request_configuration → user adds to cart, for each remaining product.
 8. When their plan is complete and all chosen items are addressed, give the cart checkout line using CART CONTEXT (exact numbers).
 9. Never ask for reconfirmation between steps. Never loop back after Add to Cart unless the user explicitly changes topic.
 
 CRITICAL — PRODUCT TRACKING IN MULTI-PRODUCT FLOW:
-When collecting variables for product N, the request_configuration tool call MUST use product N's exact name.
-Never call request_configuration with a product name from a previous turn.
-The productName in the tool call must always match the product whose variables were just collected in this turn.
+When collecting variables for product N, the request_configuration tool call MUST use product N's exact catalog row: pass both productId (that row's document id) and productName from that row — never stale values from earlier turns.
+Never call request_configuration with a product name or productId from a previous turn unless that turn is still configuring the same item.
 
 Example:
-- Collecting variables for 'Jeep Wrangler Safari' → call tool with productName: 'Jeep Wrangler Safari'
-- Collecting variables for 'Underwater Waterfall Heli-Tour' → call tool with productName: 'Underwater Waterfall Heli-Tour'
+- Collecting variables for 'Jeep Wrangler Safari' → call tool with productId from that row's id, productName: 'Jeep Wrangler Safari'
+- Collecting variables for 'Underwater Waterfall Heli-Tour' → call tool with THAT row's id as productId and productName: 'Underwater Waterfall Heli-Tour'
 Never mix these up.
+
+MULTI-ITEM CONTEXT ISOLATION (CRITICAL):
+When orchestrating multiple products, you must strictly isolate them. When calling the tool to render a configuration card for a new item, you MUST verify you are passing the exact productId, productName, and variables for the CURRENT item being discussed. NEVER reuse the productId from an item that was already added to the cart.
 
 CONVERSATION RULES:
 1. If intent is unclear — ask ONE clarifying question. Never multiple.
@@ -98,6 +100,15 @@ CONVERSATION RULES:
 4. Never ask for a variable the user already provided.
 5. Never mention formulas, base rates, or internal variable names to users.
 6. Speak in natural language — 'How many days?' not 'Please provide rental_days (min:1, max:30)'.
+
+MULTI-PRODUCT CART RULE:
+When you receive 'Item added. Continue with remaining products in the experience.' — this means the PREVIOUS product is done and added to cart. Do NOT call request_configuration for that product again.
+
+When you receive a dynamic message of the form '[exact catalog productName] has been added to cart. Now move to the next product in the user's request. Do NOT call request_configuration for [that same name] again.' — treat that product name as CLOSED; your NEXT request_configuration MUST target a different catalog row (different productId and productName).
+
+The next tool call MUST be for a DIFFERENT product — the one whose variables you just collected in the most recent messages for the NEXT item.
+
+Before calling request_configuration, state out loud which product you are configuring: 'Now configuring: [product name]'
 
 TOOL CALL TRIGGER:
 Before calling request_configuration, you MUST have collected values for ALL variables in the product. Check the product's variables list from the catalog — every variable needs a value from the conversation.
@@ -121,7 +132,7 @@ request_bundle_configuration: use bundleLabel as the human-readable title the us
 
 CART CONTEXT (only when the app includes CURRENT SHOPPING CART / cart numbers in the system prompt):
 - Those numbers are authoritative. Use them verbatim when summarizing the cart. Do not calculate or guess totals.
-- When the user message is exactly: 'Item added. Continue with remaining products in the experience.' — follow MULTI-PRODUCT FLOW step 6 only. Do not mirror cancel flows. If more products from their plan remain, your entire reply MUST be of the form: 'Now for the [productName]. [First missing variable question in natural language]' and nothing else before or after (no hedging). If their plan is complete and all products are built, use exactly: "Your cart has [itemCount] items totalling [currency] [subtotal]. Ready to checkout?" using the provided numbers.
+- When the user message matches MULTI-PRODUCT FLOW step 6 (legacy auto-message OR dynamic '[productName] has been added to cart...') — follow MULTI-PRODUCT FLOW step 6 and MULTI-PRODUCT CART RULE only. Do not mirror cancel flows. If more products from their plan remain, your entire reply MUST be of the form: 'Now for the [productName]. [First missing variable question in natural language]' and nothing else before or after (no hedging). If their plan is complete and all products are built, use exactly: "Your cart has [itemCount] items totalling [currency] [subtotal]. Ready to checkout?" using the provided numbers.
 - If they may still want more items but you need them to pick the next product, one short question is allowed — but never use wording that sounds like 'what would you like to change?' for the auto-message.
 - Never invent cart contents; if no cart block is in the prompt, do not imply a cart.
 
@@ -142,9 +153,14 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       parameters: {
         type: 'object',
         properties: {
+          productId: {
+            type: 'string',
+            description:
+              'Required on every call: the exact `_id` string from the catalog entry for THIS configuration only. Must match the same row as productName. Never copy an id from a product already configured or added to cart — always take `_id` fresh from the catalog row for the item you are configuring now.',
+          },
           productName: {
             type: 'string',
-            description: 'The exact productName from the catalog.',
+            description: 'The exact productName from that same catalog row (must correspond to productId).',
           },
           extracted_variables: {
             type: 'object',
@@ -152,7 +168,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
             additionalProperties: { type: 'number' },
           },
         },
-        required: ['productName', 'extracted_variables'],
+        required: ['productId', 'productName', 'extracted_variables'],
       },
     },
   },
@@ -210,6 +226,7 @@ export async function POST(request: NextRequest) {
 
   // Slim catalog — only what the model needs to identify products and variables
   type RawProduct = {
+    _id?: string;
     productName?: string;
     productCategory?: string;
     subCategory?: string;
@@ -221,6 +238,7 @@ export async function POST(request: NextRequest) {
     variables?: { name?: string; label?: string; role?: string; min?: number; max?: number; hint?: string }[];
   };
   const slimCatalog = (catalog ?? []).map((p: RawProduct) => ({
+    _id: p._id,
     productName: p.productName,
     productCategory: p.productCategory,
     subCategory: p.subCategory,
@@ -307,24 +325,29 @@ export async function POST(request: NextRequest) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const fn = (tc as any).function as { name: string; arguments: string } | undefined;
       if (fn?.name === 'request_configuration') {
-        let args: { productName: string; extracted_variables: Record<string, number> };
+        let args: { productId: string; productName: string; extracted_variables: Record<string, number> };
         try {
           args = JSON.parse(fn.arguments);
         } catch {
           return NextResponse.json({ error: 'Failed to parse tool arguments' }, { status: 500 });
         }
+        const productId = typeof args.productId === 'string' ? args.productId : '';
         const productName = args.productName;
         const extracted_variables = args.extracted_variables ?? {};
-        console.log('TOOL CALL PRODUCT:', productName, 'VARIABLES:', extracted_variables);
+        if (!productId.trim()) {
+          return NextResponse.json({ error: 'request_configuration requires productId' }, { status: 400 });
+        }
         const responsePayload = {
           type: 'tool_call',
           tool: 'request_configuration',
           tool_use_id: tc.id,
           input: {
+            productId,
             productName,
             extracted_variables,
           },
         };
+        console.log('TOOL CALL PRODUCT NAME:', productName);
         console.log('RETURNING TO FRONTEND:', JSON.stringify(responsePayload.input, null, 2));
         return NextResponse.json(responsePayload);
       }

@@ -11,7 +11,6 @@ import { usePathname } from 'next/navigation';
 import {
   Car, Plane, Calendar, Utensils, Printer,
   Home as HomeIcon, Camera, Dumbbell, FileText, Hammer,
-  ShoppingCart, Trash2,
 } from 'lucide-react';
 
 /* ------------------------------------------------------------------ */
@@ -36,6 +35,8 @@ type Product = {
 };
 
 type ToolCallInput = {
+  /** Convex merchantProducts document id — authoritative when resolving product vs name collisions */
+  productId?: string;
   productName: string;
   extracted_variables: Record<string, number>;
 };
@@ -48,37 +49,9 @@ type BundleToolCallInput = {
 
 type ChatEntry =
   | { kind: 'user'; text: string }
-  | { kind: 'assistant'; text: string; showCheckout?: boolean }
+  | { kind: 'assistant'; text: string }
   | { kind: 'tool_call'; input: ToolCallInput; tool_use_id: string }
   | { kind: 'bundle_tool_call'; input: BundleToolCallInput; tool_use_id: string };
-
-function stripCheckoutFlags(entries: ChatEntry[]): ChatEntry[] {
-  return entries.map((e) =>
-    e.kind === 'assistant' && e.showCheckout ? { kind: 'assistant', text: e.text } : e
-  );
-}
-
-function cartLineDisplayTotal(line: CartLine): number {
-  if (line.mandateTotalMinor != null) return line.mandateTotalMinor / 100;
-  return line.lineTotal;
-}
-
-function formatCartMandateExpiry(iso: string): string {
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-  } catch {
-    return iso;
-  }
-}
-
-function cartSummaryFrom(lines: CartLine[]): { itemCount: number; subtotal: number; currency: string } | null {
-  if (lines.length === 0) return null;
-  const currency = lines[0].currency;
-  const subtotal = lines.reduce((s, l) => s + cartLineDisplayTotal(l), 0);
-  return { itemCount: lines.length, subtotal, currency };
-}
 
 type Mandate = {
   ap2_version: string;
@@ -101,22 +74,6 @@ type Mandate = {
   total: { currency: string; amount_minor: number; signed_amount: number };
   validity_window: { ttl_seconds: number; expires_at: string };
   merchant_authorization: string;
-};
-
-type CartLine = {
-  id: string;
-  productId: Id<'merchantProducts'>;
-  productName: string;
-  storeName: string;
-  storeLocation: string;
-  currency: string;
-  unit: string;
-  variables: Record<string, number>;
-  lineTotal: number;
-  /** Set from /api/mandate line_items[].total_minor when the item is added (authoritative total, not base rate). */
-  mandateTotalMinor?: number;
-  mandateId: string;
-  expiresAt: string;
 };
 
 function buildVarsFromPending(
@@ -154,25 +111,6 @@ function evaluateProductPrice(product: Product, vars: Record<string, number>): n
     throw new Error('Price could not be calculated');
   }
   return result;
-}
-
-function readStoredUserIdentity(): { name: string; email: string; provider: string } | undefined {
-  try {
-    const identityRaw = localStorage.getItem('zolofy_identity');
-    const profileRaw = localStorage.getItem('zolofy_profile');
-    const identity = identityRaw ? JSON.parse(identityRaw) : null;
-    const profile = profileRaw ? JSON.parse(profileRaw) : null;
-    if (identity?.email || profile?.name) {
-      return {
-        name: profile?.name ?? '',
-        email: identity?.email ?? '',
-        provider: identity?.provider ?? 'self-declared',
-      };
-    }
-  } catch {
-    /* skip */
-  }
-  return undefined;
 }
 
 /* ------------------------------------------------------------------ */
@@ -296,19 +234,12 @@ export default function Home() {
   const [mandate, setMandate]         = useState<Mandate | null>(null);
   const [sheetOpen, setSheetOpen]     = useState(false);
   const [lockingIn, setLockingIn]     = useState(false);
-  const [cart, setCart]               = useState<CartLine[]>([]);
-  const [cartPanelOpen, setCartPanelOpen] = useState(false);
 
   const inputRef  = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const cartRef = useRef<CartLine[]>([]);
 
   // Auto-focus on mount
   useEffect(() => { inputRef.current?.focus(); }, []);
-
-  useEffect(() => {
-    cartRef.current = cart;
-  }, [cart]);
 
   // Scroll chat to bottom on new entries
   useEffect(() => {
@@ -322,7 +253,11 @@ export default function Home() {
     | (ChatEntry & { kind: 'tool_call' })
     | undefined;
   const identifiedProduct = toolCallEntry && products
-    ? products.find(
+    ? products.find((p) =>
+        toolCallEntry.input.productId
+          ? p._id === toolCallEntry.input.productId
+          : p.productName.toLowerCase() === toolCallEntry.input.productName.toLowerCase()
+      ) ?? products.find(
         (p) => p.productName.toLowerCase() === toolCallEntry.input.productName.toLowerCase()
       )
     : null;
@@ -436,7 +371,6 @@ export default function Home() {
     } catch { /* localStorage unavailable — skip */ }
 
     try {
-      const cartSummary = cartSummaryFrom(cartRef.current);
       const res = await fetch('/api/zolly', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -444,7 +378,6 @@ export default function Home() {
           messages: apiMessages,
           catalog: products ?? [],
           userProfile,
-          cartSummary,
         }),
       });
 
@@ -456,11 +389,15 @@ export default function Home() {
           setError(data.error);
         } else if (data.type === 'tool_call') {
           const extractedVars = (data.input.extracted_variables ?? {}) as Record<string, number>;
-          const matchedProduct = (products ?? []).find(
-            (p) => p.productName.toLowerCase() === (data.input.productName as string).toLowerCase()
-          );
+          const pid = typeof data.input.productId === 'string' ? data.input.productId : undefined;
+          const matchedProduct =
+            (products ?? []).find((p) => (pid ? p._id === pid : false)) ??
+            (products ?? []).find(
+              (p) => p.productName.toLowerCase() === (data.input.productName as string).toLowerCase()
+            );
 
           console.log('[zolly] tool_call received', {
+            productId: pid ?? null,
             productName: data.input.productName,
             extracted_variables: extractedVars,
             matchedProduct: matchedProduct?.productName ?? null,
@@ -538,16 +475,7 @@ export default function Home() {
       } else {
         const text = await res.text();
         if (text.trim()) {
-          const showCheckout =
-            cartRef.current.length > 0 && /ready to checkout/i.test(text);
-          setEntries((prev) => [
-            ...prev,
-            {
-              kind: 'assistant',
-              text,
-              ...(showCheckout ? { showCheckout: true as const } : {}),
-            },
-          ]);
+          setEntries((prev) => [...prev, { kind: 'assistant', text }]);
         }
       }
     } catch (err) {
@@ -575,7 +503,7 @@ export default function Home() {
       }, 300);
     } else {
       // Already in chat — update state first, then trigger the side effect once.
-      const nextHistory: ChatEntry[] = [...stripCheckoutFlags(entries), { kind: 'user', text: userText }];
+      const nextHistory: ChatEntry[] = [...entries, { kind: 'user', text: userText }];
       setEntries(nextHistory);
       dispatchMessage(userText, nextHistory);
     }
@@ -651,214 +579,6 @@ export default function Home() {
     } finally {
       setLockingIn(false);
     }
-  }
-
-  async function handleAddCurrentProductToCart() {
-    if (!identifiedProduct) return;
-    setError(null);
-    let vars: Record<string, number>;
-    try {
-      vars = buildVarsFromPending(identifiedProduct, pendingVars);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      return;
-    }
-    setCalculating(true);
-    const userIdentity = readStoredUserIdentity();
-    let lockedPreview: Mandate | undefined;
-    try {
-      const res = await fetch('/api/mandate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          productId: identifiedProduct._id,
-          variables: vars,
-          user_identity: userIdentity,
-        }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        setError(typeof data.error === 'string' ? data.error : 'Could not lock cart price');
-        return;
-      }
-      const preview = data as Mandate;
-      const li0 = preview.line_items[0];
-      if (li0?.total_minor == null) {
-        setError('Could not read mandate pricing for this item.');
-        return;
-      }
-      if (!preview.mandate_id || !preview.validity_window?.expires_at) {
-        setError('Mandate response missing id or expiry.');
-        return;
-      }
-      lockedPreview = preview;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      return;
-    } finally {
-      setCalculating(false);
-    }
-    if (!lockedPreview) return;
-    const totalMinor = lockedPreview.line_items[0]!.total_minor;
-    const line: CartLine = {
-      id: crypto.randomUUID(),
-      productId: identifiedProduct._id,
-      productName: identifiedProduct.productName,
-      storeName: identifiedProduct.storeName,
-      storeLocation: identifiedProduct.storeLocation,
-      currency: identifiedProduct.currency,
-      unit: identifiedProduct.unit,
-      variables: vars,
-      lineTotal: totalMinor / 100,
-      mandateTotalMinor: totalMinor,
-      mandateId: lockedPreview.mandate_id,
-      expiresAt: lockedPreview.validity_window.expires_at,
-    };
-
-    setCart((prev) => {
-      const newCart = [...prev, line];
-      cartRef.current = newCart;
-      return newCart;
-    });
-    setMandate(null);
-    setSheetOpen(false);
-    setCartPanelOpen(false);
-    setPendingVars({});
-    const followUp = 'Item added. Continue with remaining products in the experience.';
-    const base = entries.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call');
-    const nextHistory: ChatEntry[] = [...base, { kind: 'user', text: followUp }];
-    setEntries(nextHistory);
-    await dispatchMessage(followUp, nextHistory);
-  }
-
-  async function handleAddBundleToCart() {
-    if (!bundleEntry) return;
-    setError(null);
-    const built: { id: string; productId: Id<'merchantProducts'>; productName: string; storeName: string; storeLocation: string; currency: string; unit: string; variables: Record<string, number> }[] = [];
-    try {
-      for (const { item, product } of bundleProducts) {
-        if (!product) {
-          throw new Error(`Product "${item.productName}" not in catalog yet.`);
-        }
-        const vars = buildVarsFromPending(product, pendingBundleVars[item.productName] ?? {});
-        built.push({
-          id: crypto.randomUUID(),
-          productId: product._id,
-          productName: product.productName,
-          storeName: product.storeName,
-          storeLocation: product.storeLocation,
-          currency: product.currency,
-          unit: product.unit,
-          variables: vars,
-        });
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      return;
-    }
-
-    setCalculating(true);
-    const userIdentity = readStoredUserIdentity();
-    let newLines: CartLine[];
-    try {
-      newLines = await Promise.all(
-        built.map(async (b) => {
-          const res = await fetch('/api/mandate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              productId: b.productId,
-              variables: b.variables,
-              user_identity: userIdentity,
-            }),
-          });
-          const data = await res.json();
-          if (data.error) {
-            throw new Error(typeof data.error === 'string' ? data.error : 'Could not lock cart price');
-          }
-          const preview = data as Mandate;
-          const li0 = preview.line_items[0];
-          if (li0?.total_minor == null) {
-            throw new Error('Could not read mandate pricing for this item.');
-          }
-          if (!preview.mandate_id || !preview.validity_window?.expires_at) {
-            throw new Error('Mandate response missing id or expiry.');
-          }
-          const tm = li0.total_minor;
-          return {
-            ...b,
-            lineTotal: tm / 100,
-            mandateTotalMinor: tm,
-            mandateId: preview.mandate_id,
-            expiresAt: preview.validity_window.expires_at,
-          };
-        })
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      return;
-    } finally {
-      setCalculating(false);
-    }
-
-    setCart((prev) => {
-      const newCart = [...prev, ...newLines];
-      cartRef.current = newCart;
-      return newCart;
-    });
-    setMandate(null);
-    setSheetOpen(false);
-    setCartPanelOpen(false);
-    setPendingBundleVars({});
-    const followUp = 'Item added. Continue with remaining products in the experience.';
-    const base = entries.filter((e) => e.kind !== 'tool_call' && e.kind !== 'bundle_tool_call');
-    const nextHistory: ChatEntry[] = [...base, { kind: 'user', text: followUp }];
-    setEntries(nextHistory);
-    await dispatchMessage(followUp, nextHistory);
-  }
-
-  async function handleCheckoutAll() {
-    if (cart.length === 0) return;
-    const currencies = [...new Set(cart.map((c) => c.currency))];
-    if (currencies.length > 1) {
-      setError('Your cart mixes currencies. Remove items until only one currency remains.');
-      return;
-    }
-    setError(null);
-    setCalculating(true);
-
-    const userIdentity = readStoredUserIdentity();
-
-    try {
-      const res = await fetch('/api/mandate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          items: cart.map((c) => ({ productId: c.productId, variables: c.variables })),
-          bundleLabel: 'Your cart',
-          bundleName: `CART_${Date.now()}`,
-          user_identity: userIdentity,
-        }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-      } else {
-        setCart([]);
-        cartRef.current = [];
-        setCartPanelOpen(false);
-        setMandate(data as Mandate);
-        setSheetOpen(true);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setCalculating(false);
-    }
-  }
-
-  function removeCartLine(id: string) {
-    setCart((prev) => prev.filter((l) => l.id !== id));
   }
 
   function handleCancelConfirmation() {
@@ -949,9 +669,6 @@ export default function Home() {
       setPendingBundleVars({});
       setError(null);
       setLockingIn(false);
-      setCart([]);
-      cartRef.current = [];
-      setCartPanelOpen(false);
       setOpacity(0);
       setTimeout(() => {
         setMode('landing');
@@ -961,8 +678,6 @@ export default function Home() {
   }
 
   const canSend = input.trim().length > 0 && !sending;
-
-  const cartCount = cart.length;
 
   /* ── Shared header ── */
   const header = (
@@ -978,51 +693,6 @@ export default function Home() {
     >
       <span style={{ fontSize: '18px', fontWeight: 600, color: '#5C4EFF', letterSpacing: '-0.01em' }}>Zolofy</span>
       <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
-        {mode === 'chat' && (
-          <button
-            type="button"
-            onClick={() => setCartPanelOpen(true)}
-            aria-label={cartCount ? `Open cart, ${cartCount} items` : 'Open cart'}
-            style={{
-              position: 'relative',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 40,
-              height: 40,
-              borderRadius: 12,
-              border: `1px solid ${SEPARATOR}`,
-              background: '#FFFFFF',
-              cursor: 'pointer',
-              color: TEXT_PRIMARY,
-            }}
-          >
-            <ShoppingCart size={20} strokeWidth={2} aria-hidden />
-            {cartCount > 0 && (
-              <span
-                style={{
-                  position: 'absolute',
-                  top: -4,
-                  right: -4,
-                  minWidth: 18,
-                  height: 18,
-                  padding: '0 5px',
-                  borderRadius: 9,
-                  background: ACCENT,
-                  color: '#FFFFFF',
-                  fontSize: 11,
-                  fontWeight: 700,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  lineHeight: 1,
-                }}
-              >
-                {cartCount > 99 ? '99+' : cartCount}
-              </span>
-            )}
-          </button>
-        )}
         <Link
           href="/merchant-lab"
           style={{ fontSize: '13px', fontWeight: 500, color: TEXT_SECONDARY, textDecoration: 'none' }}
@@ -1036,10 +706,10 @@ export default function Home() {
   /* ── Shared input bar ── */
   // Typewriter placeholder phrases for landing
   const PLACEHOLDER_PHRASES = [
-    'Plan a trip to Mauritius...',
-    'Charter a private jet from SF to Dubai...',
-    'Organise a corporate event for 100 people in Bangalore...',
-    'Renovate my living room with premium oak flooring...',
+    'Rent a Jeep Wrangler in Mauritius for 5 days...',
+    'Charter a private jet from Dubai to London...',
+    'Get a quote for premium catering for 200 guests...',
+    'Print a 10x20 ft custom banner with a premium finish...',
   ];
 
   const [placeholderIndex, setPlaceholderIndex] = useState(0);
@@ -1356,7 +1026,6 @@ export default function Home() {
                   }
 
                   if (entry.kind === 'assistant') {
-                    const showProceed = Boolean(entry.showCheckout && cart.length > 0);
                     return (
                       <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginTop }}>
                         <ZollyAvatar />
@@ -1378,30 +1047,6 @@ export default function Home() {
                           >
                             <MarkdownText text={entry.text} />
                           </div>
-                          {showProceed && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void handleCheckoutAll();
-                              }}
-                              disabled={calculating}
-                              style={{
-                                marginTop: 12,
-                                width: '100%',
-                                height: 48,
-                                fontSize: '15px',
-                                fontWeight: 600,
-                                borderRadius: 12,
-                                background: calculating ? SEPARATOR : ACCENT,
-                                color: calculating ? TEXT_SECONDARY : '#FFFFFF',
-                                border: 'none',
-                                cursor: calculating ? 'default' : 'pointer',
-                                letterSpacing: '-0.01em',
-                              }}
-                            >
-                              {calculating ? 'Preparing…' : 'Proceed to Checkout'}
-                            </button>
-                          )}
                         </div>
                       </div>
                     );
@@ -1418,10 +1063,6 @@ export default function Home() {
                             values={pendingBundleVars}
                             onChange={setPendingBundleVars}
                             onCheckoutNow={handleBundleLockIn}
-                            onAddAllToCart={() => {
-                              void handleAddBundleToCart();
-                            }}
-                            cartEmpty={cart.length === 0}
                             onCancel={handleCancelConfirmation}
                             lockingIn={lockingIn || calculating}
                             mandate={mandate}
@@ -1441,11 +1082,7 @@ export default function Home() {
                           productName={entry.input.productName}
                           values={pendingVars}
                           onChange={setPendingVars}
-                          onCheckoutNow={handleLockIn}
-                          onAddToCart={() => {
-                            void handleAddCurrentProductToCart();
-                          }}
-                          cartEmpty={cart.length === 0}
+                          onLockIn={handleLockIn}
                           onCancel={handleCancelConfirmation}
                           lockingIn={lockingIn || calculating}
                           mandate={mandate}
@@ -1507,17 +1144,6 @@ export default function Home() {
           </div>
         </div>
       )}
-
-      <CartSlidePanel
-        open={cartPanelOpen}
-        onClose={() => setCartPanelOpen(false)}
-        cart={cart}
-        onRemove={removeCartLine}
-        onCheckoutAll={() => {
-          void handleCheckoutAll();
-        }}
-        checkoutLoading={calculating}
-      />
 
       {/* ── MANDATE SHEET ── */}
       {mandate && (
@@ -1898,9 +1524,7 @@ function ConfirmationCard({
   productName,
   values,
   onChange,
-  onCheckoutNow,
-  onAddToCart,
-  cartEmpty,
+  onLockIn,
   onCancel,
   lockingIn,
   mandate,
@@ -1909,9 +1533,7 @@ function ConfirmationCard({
   productName: string;
   values: Record<string, string>;
   onChange: (v: Record<string, string>) => void;
-  onCheckoutNow: () => void;
-  onAddToCart?: () => void;
-  cartEmpty: boolean;
+  onLockIn: () => void;
   onCancel: () => void;
   lockingIn: boolean;
   mandate: Mandate | null;
@@ -1973,62 +1595,39 @@ function ConfirmationCard({
             ))}
           </div>
 
-          {/* Lock it in + Add to Cart — side by side, equal width */}
-          <div style={{ display: 'flex', gap: 12, marginTop: 20 }}>
-            {onAddToCart && (
-              <button
-                type="button"
-                onClick={onAddToCart}
-                disabled={lockingIn || !product}
-                style={{
-                  flex: 1,
-                  height: 52,
-                  fontSize: '16px',
-                  fontWeight: 600,
-                  borderRadius: 12,
-                  background: '#FFFFFF',
-                  color: '#5C4EFF',
-                  border: '1px solid #5C4EFF',
-                  cursor: lockingIn || !product ? 'default' : 'pointer',
-                  letterSpacing: '-0.01em',
-                }}
-              >
-                Add to Cart
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={onCheckoutNow}
-              disabled={primaryDisabled}
-              className={lockingIn ? 'zolly-pulse' : ''}
-              style={{
-                flex: 1,
-                height: 52,
-                fontSize: '16px',
-                fontWeight: 600,
-                borderRadius: 12,
-                background: primaryDisabled && !lockingIn ? '#E5E5EA' : '#5C4EFF',
-                color: primaryDisabled && !lockingIn ? '#6C6C70' : '#FFFFFF',
-                border: 'none',
-                cursor: primaryDisabled ? 'default' : 'pointer',
-                letterSpacing: '-0.01em',
-                transition: 'transform 80ms ease-out, background 150ms ease-out',
-              }}
-              onMouseDown={(e) => {
-                if (!primaryDisabled) {
-                  e.currentTarget.style.transform = 'scale(0.97)';
-                }
-              }}
-              onMouseUp={(e) => {
-                e.currentTarget.style.transform = 'scale(1)';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.transform = 'scale(1)';
-              }}
-            >
-              {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={onLockIn}
+            disabled={primaryDisabled}
+            className={lockingIn ? 'zolly-pulse' : ''}
+            style={{
+              width: '100%',
+              height: 52,
+              marginTop: 20,
+              fontSize: '16px',
+              fontWeight: 600,
+              borderRadius: 12,
+              background: primaryDisabled && !lockingIn ? '#E5E5EA' : '#5C4EFF',
+              color: primaryDisabled && !lockingIn ? '#6C6C70' : '#FFFFFF',
+              border: 'none',
+              cursor: primaryDisabled ? 'default' : 'pointer',
+              letterSpacing: '-0.01em',
+              transition: 'transform 80ms ease-out, background 150ms ease-out',
+            }}
+            onMouseDown={(e) => {
+              if (!primaryDisabled) {
+                e.currentTarget.style.transform = 'scale(0.97)';
+              }
+            }}
+            onMouseUp={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
+          </button>
 
           {/* Cancel — plain text link */}
           <button
@@ -2061,8 +1660,6 @@ function BundleConfirmationCard({
   values,
   onChange,
   onCheckoutNow,
-  onAddAllToCart,
-  cartEmpty,
   onCancel,
   lockingIn,
   mandate,
@@ -2072,8 +1669,6 @@ function BundleConfirmationCard({
   values: Record<string, Record<string, string>>;
   onChange: (v: Record<string, Record<string, string>>) => void;
   onCheckoutNow: () => void;
-  onAddAllToCart?: () => void;
-  cartEmpty: boolean;
   onCancel: () => void;
   lockingIn: boolean;
   mandate: Mandate | null;
@@ -2085,9 +1680,6 @@ function BundleConfirmationCard({
     .map(({ product, item }) => product?.storeName ?? item.productName)
     .filter((s, i, a) => a.indexOf(s) === i)
     .join(' · ');
-
-  const baseTotal = items.reduce((acc, { product }) => acc + (product?.baseRate ?? 0), 0);
-  const currency = items.find(({ product }) => product)?.product?.currency ?? '';
 
   return (
     <div
@@ -2201,29 +1793,6 @@ function BundleConfirmationCard({
       >
         {lockingIn ? 'Locking in…' : locked ? 'Locked ✓' : 'Lock it in'}
       </button>
-
-      {onAddAllToCart && (
-        <button
-          type="button"
-          onClick={onAddAllToCart}
-          disabled={lockingIn || items.some(({ product }) => !product)}
-          style={{
-            width: '100%',
-            height: 44,
-            marginTop: 12,
-            fontSize: '16px',
-            fontWeight: 600,
-            borderRadius: 12,
-            background: '#FFFFFF',
-            color: '#5C4EFF',
-            border: '1px solid #5C4EFF',
-            cursor: lockingIn || items.some(({ product }) => !product) ? 'default' : 'pointer',
-            letterSpacing: '-0.01em',
-          }}
-        >
-          Add to Cart
-        </button>
-      )}
 
       {/* Cancel — plain text link */}
       <button
@@ -2665,241 +2234,6 @@ function NavSidebar() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Cart slide panel                                                  */
-/* ------------------------------------------------------------------ */
-
-function CartSlidePanel({
-  open,
-  onClose,
-  cart,
-  onRemove,
-  onCheckoutAll,
-  checkoutLoading,
-}: {
-  open: boolean;
-  onClose: () => void;
-  cart: CartLine[];
-  onRemove: (id: string) => void;
-  onCheckoutAll: () => void;
-  checkoutLoading: boolean;
-}) {
-  const currency = cart[0]?.currency ?? '';
-  const total = cart.reduce((s, c) => s + cartLineDisplayTotal(c), 0);
-
-  return (
-    <>
-      <div
-        onClick={open ? onClose : undefined}
-        style={{
-          position: 'fixed',
-          inset: 0,
-          background: 'rgba(0,0,0,0.35)',
-          zIndex: 90,
-          opacity: open ? 1 : 0,
-          transition: 'opacity 220ms ease',
-          pointerEvents: open ? 'auto' : 'none',
-        }}
-        aria-hidden={!open}
-      />
-      <aside
-        aria-hidden={!open}
-        aria-label="Shopping cart"
-        style={{
-          position: 'fixed',
-          top: 0,
-          right: 0,
-          bottom: 0,
-          width: 'min(420px, 100vw)',
-          background: '#FFFFFF',
-          boxShadow: open ? '-8px 0 40px rgba(0,0,0,0.14)' : 'none',
-          zIndex: 95,
-          display: 'flex',
-          flexDirection: 'column',
-          transform: open ? 'translateX(0)' : 'translateX(100%)',
-          transition: 'transform 280ms cubic-bezier(0.32, 0.72, 0, 1)',
-          pointerEvents: open ? 'auto' : 'none',
-        }}
-      >
-        <div
-          style={{
-            padding: '20px 22px 16px',
-            borderBottom: `1px solid ${SEPARATOR}`,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            flexShrink: 0,
-          }}
-        >
-          <span style={{ fontSize: '18px', fontWeight: 600, color: TEXT_PRIMARY, letterSpacing: '-0.02em' }}>
-            Cart
-          </span>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close cart"
-            style={{
-              width: 36,
-              height: 36,
-              borderRadius: '50%',
-              border: 'none',
-              background: '#F4F4F5',
-              cursor: 'pointer',
-              fontSize: 20,
-              color: TEXT_SECONDARY,
-              lineHeight: 1,
-            }}
-          >
-            ×
-          </button>
-        </div>
-
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 22px' }}>
-          {cart.length === 0 ? (
-            <p style={{ fontSize: '14px', color: TEXT_SECONDARY, margin: 0, lineHeight: 1.5 }}>
-              Your cart is empty. Confirm a product with Zolly and tap &quot;Add to Cart&quot;.
-            </p>
-          ) : (
-            <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {cart.map((line) => (
-                <li
-                  key={line.id}
-                  style={{
-                    display: 'flex',
-                    gap: 12,
-                    alignItems: 'flex-start',
-                    padding: 14,
-                    borderRadius: 14,
-                    border: `1px solid ${SEPARATOR}`,
-                    background: '#FAFAFA',
-                  }}
-                >
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div
-                      style={{
-                        fontSize: '14px',
-                        fontWeight: 600,
-                        color: TEXT_PRIMARY,
-                        marginBottom: 4,
-                        lineHeight: 1.35,
-                      }}
-                    >
-                      {line.productName}
-                    </div>
-                    <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginBottom: 6 }}>
-                      {line.storeName}
-                      {line.storeLocation ? ` · ${line.storeLocation}` : ''}
-                    </div>
-                    <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginBottom: 8 }}>
-                      <span style={{ fontWeight: 600, color: TEXT_PRIMARY }}>Mandate</span>{' '}
-                      <span
-                        style={{
-                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-                          fontSize: '11px',
-                          wordBreak: 'break-all',
-                        }}
-                      >
-                        {line.mandateId}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: '12px', color: TEXT_SECONDARY, marginBottom: 8 }}>
-                      <span style={{ fontWeight: 600 }}>Expires</span> {formatCartMandateExpiry(line.expiresAt)}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: '15px',
-                        fontWeight: 700,
-                        color: ACCENT,
-                        fontVariantNumeric: 'tabular-nums',
-                        lineHeight: 1.35,
-                      }}
-                    >
-                      {line.currency} {cartLineDisplayTotal(line).toLocaleString()}{' '}
-                      <span style={{ fontSize: '13px', fontWeight: 600, color: TEXT_PRIMARY }}>total</span>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => onRemove(line.id)}
-                    aria-label={`Remove ${line.productName}`}
-                    style={{
-                      flexShrink: 0,
-                      width: 36,
-                      height: 36,
-                      borderRadius: 10,
-                      border: `1px solid ${SEPARATOR}`,
-                      background: '#FFFFFF',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      color: TEXT_SECONDARY,
-                    }}
-                  >
-                    <Trash2 size={16} strokeWidth={2} aria-hidden />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        <div
-          style={{
-            padding: '16px 22px 24px',
-            borderTop: `1px solid ${SEPARATOR}`,
-            flexShrink: 0,
-            background: '#FFFFFF',
-          }}
-        >
-          {cart.length > 0 && (
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'baseline',
-                justifyContent: 'space-between',
-                marginBottom: 14,
-              }}
-            >
-              <span style={{ fontSize: '14px', color: TEXT_SECONDARY, fontWeight: 600 }}>Cart Total</span>
-              <span
-                style={{
-                  fontSize: '20px',
-                  fontWeight: 700,
-                  color: TEXT_PRIMARY,
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                {currency} {total.toLocaleString()}
-              </span>
-            </div>
-          )}
-          <button
-            type="button"
-            onClick={onCheckoutAll}
-            disabled={cart.length === 0 || checkoutLoading}
-            className={checkoutLoading ? 'zolly-pulse' : ''}
-            style={{
-              width: '100%',
-              height: 52,
-              fontSize: '16px',
-              fontWeight: 600,
-              borderRadius: 12,
-              background: cart.length === 0 || checkoutLoading ? SEPARATOR : ACCENT,
-              color: cart.length === 0 || checkoutLoading ? TEXT_SECONDARY : '#FFFFFF',
-              border: 'none',
-              cursor: cart.length === 0 || checkoutLoading ? 'default' : 'pointer',
-              letterSpacing: '-0.01em',
-            }}
-          >
-            {checkoutLoading ? 'Preparing checkout…' : 'Checkout All'}
-          </button>
-        </div>
-      </aside>
-    </>
-  );
-}
-
-/* ------------------------------------------------------------------ */
 /*  Mandate sheet                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -3268,7 +2602,7 @@ function MandateSheet({
                     marginBottom: 24,
                   }}
                 >
-                  {/* Multi-item line breakdown (bundle / cart checkout) */}
+                  {/* Multi-item line breakdown (bundles) */}
                   {isBundle && (
                     <div
                       style={{
