@@ -10,8 +10,9 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: 'Zolofy Agentic — Vibe Shopping',
+  title: 'Zolofy - Agentic Commerce',
   description: 'UCP-compliant agentic commerce interface',
+  icons: { icon: '/z_icon.png' },
 };
 
 export default function RootLayout({
