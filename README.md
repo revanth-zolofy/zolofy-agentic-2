@@ -2,7 +2,7 @@
 
 > **UCP v2026-04-08 compliant** · Built with Next.js · Powered by Convex
 
-Zolofy is an open-source, protocol-native shopping interface that lets AI agents discover, configure, and purchase products through natural language — without scraping, screen-reading, or brittle integrations.
+Zolofy turns natural-language buyer intent into deterministic CPQ pricing and signed, time-bound checkout mandates..
 
 ---
 
