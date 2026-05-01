@@ -61,6 +61,7 @@ const CATALOG_GRADIENT = 'linear-gradient(180deg, #F2F2F7 0%, #E8EEFB 100%)';
 const WORDMARK_GRADIENT = `linear-gradient(90deg, ${COLORS.accent}, ${COLORS.accentEnd})`;
 
 const CATEGORY_COLORS: Record<string, { bg: string; text: string }> = {
+  'Luxury Travel': { bg: '#EFF6FF', text: '#1D4ED8' },
   Automotive:  { bg: '#EFF6FF', text: '#1D4ED8' },
   Travel:      { bg: '#F0FDF4', text: '#166534' },
   Catering:    { bg: '#FFF7ED', text: '#9A3412' },
@@ -78,6 +79,7 @@ function categoryPalette(category: string) {
 }
 
 const CATEGORIES = [
+  'Luxury Travel',
   'Luxury Rentals',
   'Trip Planning',
   'Event Management',
@@ -270,12 +272,12 @@ export default function MerchantLab() {
     );
   }
 
-  /* ── load product into form for editing ── */
-  function loadProductForEdit(product: Product) {
-    setEditingId(product._id);
+  function applyProductToForm(product: Product, mode: 'edit' | 'clone') {
+    if (mode === 'edit') setEditingId(product._id);
+    else setEditingId(null);
     setStoreName(product.storeName);
     setStoreLocation(product.storeLocation);
-    setProductName(product.productName);
+    setProductName(mode === 'clone' ? `${product.productName} (Copy)` : product.productName);
     setProductCategory(product.productCategory);
     setSubCategory(product.subCategory ?? '');
     setUnit(product.unit);
@@ -302,6 +304,18 @@ export default function MerchantLab() {
         value: String(value),
       }))
     );
+  }
+
+  /* ── load product into form for editing ── */
+  function loadProductForEdit(product: Product) {
+    applyProductToForm(product, 'edit');
+    setError(null);
+    setSuccess(false);
+    formTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function handleClone(product: Product) {
+    applyProductToForm(product, 'clone');
     setError(null);
     setSuccess(false);
     formTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1034,6 +1048,7 @@ export default function MerchantLab() {
                       product={p}
                       isEditing={editingId === p._id}
                       onEdit={loadProductForEdit}
+                      onClone={handleClone}
                       onDelete={handleDelete}
                     />
                   ))}
@@ -1093,11 +1108,13 @@ function LabProductCard({
   product,
   isEditing,
   onEdit,
+  onClone,
   onDelete,
 }: {
   product: Product;
   isEditing: boolean;
   onEdit: (product: Product) => void;
+  onClone: (product: Product) => void;
   onDelete: (product: Product) => void;
 }) {
   const palette = categoryPalette(product.productCategory);
@@ -1149,8 +1166,8 @@ function LabProductCard({
           )}
         </div>
 
-        {/* Edit + Delete button group */}
-        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+        {/* Edit + Clone + Delete */}
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           <button
             type="button"
             onClick={() => onEdit(product)}
@@ -1169,6 +1186,24 @@ function LabProductCard({
             }}
           >
             {isEditing ? 'Editing…' : 'Edit'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onClone(product)}
+            style={{
+              height: 26,
+              padding: '0 10px',
+              fontSize: '12px',
+              fontWeight: 500,
+              borderRadius: 7,
+              background: COLORS.bg,
+              color: COLORS.secondary,
+              border: `1px solid ${COLORS.separator}`,
+              cursor: 'pointer',
+              transition: 'background 150ms ease, border-color 150ms ease',
+            }}
+          >
+            Clone
           </button>
           <button
             type="button"

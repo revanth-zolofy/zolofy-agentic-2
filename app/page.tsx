@@ -136,16 +136,17 @@ const SEND_ICON = (
   </svg>
 );
 
-const CATEGORY_PILLS: { icon: string; label: string }[] = [
-  { icon: '/symbols/icons8-car-100.png',        label: 'Luxury Rentals' },
-  { icon: '/symbols/icons8-plane-100.png',       label: 'Trip Planning' },
-  { icon: '/symbols/icons8-calendar-100.png',    label: 'Event Management' },
-  { icon: '/symbols/icons8-maintenance-100.png', label: 'Home Renovation' },
+const CATEGORY_PILLS: { icon: string; label: string; prompt: string }[] = [
+  { icon: '/symbols/icons8-car-100.png',        label: 'Luxury Travel', prompt: 'Luxury Travel' },
+  { icon: '/symbols/icons8-plane-100.png',       label: 'Trip Planning', prompt: 'Trip Planning' },
+  { icon: '/symbols/icons8-calendar-100.png',    label: 'Event Management', prompt: 'Event Management' },
+  { icon: '/symbols/icons8-maintenance-100.png', label: 'Home Renovation', prompt: 'Home Renovation' },
 ];
 
 type LucideIcon = React.ComponentType<{ size?: number; color?: string; strokeWidth?: number }>;
 
 const CATEGORY_ICONS: Record<string, LucideIcon> = {
+  'Luxury Travel':      Car,
   'Luxury Rentals':     Car,
   'Trip Planning':      Plane,
   'Event Management':   Calendar,
@@ -893,9 +894,9 @@ export default function Home() {
             >
               {CATEGORY_PILLS.map((pill) => (
                 <InvitationChip
-                  key={pill.label}
+                  key={pill.prompt}
                   label={pill.label}
-                  onClick={() => handlePillClick(pill.label)}
+                  onClick={() => handlePillClick(pill.prompt)}
                 />
               ))}
             </div>
