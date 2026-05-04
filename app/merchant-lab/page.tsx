@@ -71,7 +71,8 @@ const CATEGORY_COLORS: Record<string, { bg: string; text: string }> = {
   Photography: { bg: '#FFFBEB', text: '#92400E' },
   Fitness:     { bg: '#F0FDF4', text: '#14532D' },
   Legal:       { bg: '#F5F3FF', text: '#4C1D95' },
-  Renovation:  { bg: '#FEF3C7', text: '#78350F' },
+  'Property Management': { bg: '#FEF3C7', text: '#78350F' },
+  Renovation: { bg: '#FEF3C7', text: '#78350F' },
 };
 
 function categoryPalette(category: string) {
@@ -83,7 +84,7 @@ const CATEGORIES = [
   'Luxury Rentals',
   'Trip Planning',
   'Event Management',
-  'Renovation',
+  'Property Management',
   'Catering',
   'Printing & Branding',
 ];

@@ -140,7 +140,7 @@ const CATEGORY_PILLS: { icon: string; label: string; prompt: string }[] = [
   { icon: '/symbols/icons8-car-100.png',        label: 'Luxury Travel', prompt: 'Luxury Travel' },
   { icon: '/symbols/icons8-plane-100.png',       label: 'Trip Planning', prompt: 'Trip Planning' },
   { icon: '/symbols/icons8-calendar-100.png',    label: 'Event Management', prompt: 'Event Management' },
-  { icon: '/symbols/icons8-maintenance-100.png', label: 'Home Renovation', prompt: 'Home Renovation' },
+  { icon: '/symbols/icons8-maintenance-100.png', label: 'Property Management', prompt: 'Property Management' },
 ];
 
 type LucideIcon = React.ComponentType<{ size?: number; color?: string; strokeWidth?: number }>;
@@ -150,6 +150,7 @@ const CATEGORY_ICONS: Record<string, LucideIcon> = {
   'Luxury Rentals':     Car,
   'Trip Planning':      Plane,
   'Event Management':   Calendar,
+  'Property Management': Hammer,
   'Home Renovation':    Hammer,
   'Renovation':         Hammer,
   'Catering':           Utensils,
